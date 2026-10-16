@@ -248,24 +248,84 @@ test("a clean empty journal reports no subagents only after the read settles", a
 test("parent sessions keep independent subagent trees", async () => {
 	const harness = makeHarness();
 	await harness.panel.activate(harness.ctx);
-	harness.panel.onLifecycle({ id: "agent", agent: "ParentOneAgent", status: "started" });
+	harness.panel.onLifecycle({
+		id: "agent", agent: "ParentOneAgent", parentToolCallId: "call-a", status: "started",
+	});
 
 	const secondContext = {
 		sessionManager: {
 			getSessionId: () => "s2",
-			getEntries: () => [],
+			getEntries: () => [{
+				type: "message",
+				message: { role: "assistant", content: [{
+					type: "toolCall", id: "call-b", name: "task", arguments: {},
+				}] },
+			}],
 			getSessionFile: () => undefined,
 			getArtifactsDir: () => null,
 		},
 	} as unknown as ExtensionContext;
 	await harness.panel.activate(secondContext);
 	expect(harness.panel.render(THEME, 100, 8).join("\n")).toContain("No subagents");
-	harness.panel.onLifecycle({ id: "agent", agent: "ParentTwoAgent", status: "started" });
+	harness.panel.onLifecycle({
+		id: "agent", agent: "ParentTwoAgent", parentToolCallId: "call-b", status: "started",
+	});
 	expect(harness.panel.render(THEME, 100, 8).join("\n")).toContain("ParentTwoAgent");
 
 	await harness.panel.activate(harness.ctx);
 	const first = harness.panel.render(THEME, 100, 8).join("\n");
 	expect(first).toContain("ParentOneAgent");
 	expect(first).not.toContain("ParentTwoAgent");
+	harness.panel.dispose();
+});
+
+test("late child events update their parent tree after a session switch", async () => {
+	const harness = makeHarness();
+	await harness.panel.activate(harness.ctx);
+	harness.panel.onLifecycle({ id: "child-a", agent: "AgentA", status: "started" });
+	harness.panel.onEvent(start("child-a", 1));
+	const second = makeHarness([], "s2").ctx;
+	await harness.panel.activate(second);
+	harness.panel.onEvent(end("child-a", 1, true));
+	harness.panel.onProgress({ id: "child-a", sessionFile: "/missing/a.jsonl" });
+	harness.panel.onLifecycle({ id: "child-a", agent: "AgentA", status: "completed" });
+	expect(harness.panel.render(THEME, 100, 12).join("\n")).toContain("No subagents");
+	await harness.panel.activate(harness.ctx);
+	const lines = harness.panel.render(THEME, 100, 12);
+	expect(lineWith(lines, "AgentA")).toContain("completed");
+	expect(lineWith(lines, "tool1")).toContain("error");
+	harness.panel.dispose();
+});
+
+test("parent call evidence distinguishes shared runtime IDs across sessions", async () => {
+	const harness = makeHarness();
+	await harness.panel.activate(harness.ctx);
+	harness.panel.onLifecycle({
+		id: "shared", agent: "AgentA", parentToolCallId: "parent-a", status: "started",
+	});
+	harness.panel.onEvent(start("shared", 1));
+	const second = makeHarness([{
+		type: "message",
+		message: { role: "assistant", content: [{
+			type: "toolCall", id: "parent-b", name: "task", arguments: {},
+		}] },
+	}], "s2").ctx;
+	await harness.panel.activate(second);
+	harness.panel.onLifecycle({
+		id: "shared", agent: "AgentB", parentToolCallId: "parent-b", status: "started",
+	});
+	harness.panel.onEvent(start("shared", 2));
+	harness.panel.onEvent(end("shared", 1, true));
+	harness.panel.onLifecycle({
+		id: "shared", agent: "AgentA", parentToolCallId: "parent-a", status: "completed",
+	});
+	const active = harness.panel.render(THEME, 100, 12);
+	expect(lineWith(active, "AgentB")).toContain("running");
+	expect(lineWith(active, "tool2")).toContain("running");
+	expect(active.join("\n")).not.toContain("AgentA");
+	await harness.panel.activate(harness.ctx);
+	const previous = harness.panel.render(THEME, 100, 12);
+	expect(lineWith(previous, "AgentA")).toContain("completed");
+	expect(lineWith(previous, "tool1")).toContain("error");
 	harness.panel.dispose();
 });

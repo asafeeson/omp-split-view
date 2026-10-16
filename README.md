@@ -71,6 +71,8 @@ Consumers do **not** need `bun install`: native SDK/TUI modules come from OMP.
   Each run retains its last seven tool calls and separate agent/action states.
   History spans parent-session branches; resume marks unconfirmed activity
   unknown. The panel never shows agent thinking, messages or tool output.
+  Late child events update their owning parent tree, not the selected session.
+  Conflicting ownership evidence is not assigned to the current session.
 - **Files**: newest-first read/write/seen/subagent paths, plus edit diff.
   Native inline read selectors are removed from file names; non-file URLs
   and internal URIs are not treated as filesystem paths.

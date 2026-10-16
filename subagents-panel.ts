@@ -152,6 +152,8 @@ interface SessionTree {
 	currentRunByRuntime: Map<string, Run>;
 	/** `${runtimeId}\u0000${toolCallId}` → owning run (retained actions only). */
 	actionOwner: Map<string, Run>;
+	/** Parent task calls provide ownership evidence across session switches. */
+	parentToolCallIds: Set<string>;
 	nextOrdinal: number;
 	phase: PanelPhase;
 	phaseReason?: string;
@@ -482,6 +484,7 @@ function readChildJournal(entries: readonly unknown[]): Journal {
  */
 export class SubagentsPanel {
 	private readonly trees = new Map<string, SessionTree>();
+	private readonly runtimeOwners = new Map<string, SessionTree>();
 	private activeSessionId: string | undefined;
 	private disposed = false;
 
@@ -524,6 +527,22 @@ export class SubagentsPanel {
 			return;
 		}
 
+		tree.parentToolCallIds.clear();
+		for (const entry of entries) {
+			const record = fieldBag(entry);
+			if (record.type !== "message") continue;
+			const message = fieldBag(record.message);
+			if (message.role === "toolResult" && message.toolName === "task") {
+				const id = str(message.toolCallId);
+				if (id) tree.parentToolCallIds.add(id);
+			} else if (message.role === "assistant" && Array.isArray(message.content)) {
+				for (const content of message.content) {
+					const call = fieldBag(content);
+					if (call.type === "toolCall" && call.name === "task" && str(call.id))
+						tree.parentToolCallIds.add(str(call.id));
+				}
+			}
+		}
 		if (this.restoreSnapshots(tree, entries)) tree.incomplete = true;
 		this.restoreLegacyResults(tree, entries);
 
@@ -577,11 +596,11 @@ export class SubagentsPanel {
 
 	/** Native lifecycle: the only boundary of a new confirmed run. */
 	onLifecycle(data: unknown): void {
-		const tree = this.activeTree();
-		if (!tree) return;
 		const bag = fieldBag(data);
 		const runtimeId = str(bag.id);
 		if (!runtimeId) return;
+		const tree = this.eventTree(runtimeId, str(bag.parentToolCallId));
+		if (!tree) return;
 		const agent = sanitizeText(bag.agent, AGENT_MAX);
 		const index = count(bag.index);
 		const parentToolCallId = str(bag.parentToolCallId) || undefined;
@@ -601,6 +620,7 @@ export class SubagentsPanel {
 			if (sessionFile) run.sessionFile = sessionFile;
 			run.status = "running";
 			tree.currentRunByRuntime.set(runtimeId, run);
+			this.runtimeOwners.set(runtimeId, tree);
 			this.noteActivity(tree, run);
 			this.touch(tree, run);
 			return;
@@ -608,8 +628,11 @@ export class SubagentsPanel {
 
 		const terminal = enumOf(LIFECYCLE_TERMINAL, bag.status);
 		if (!terminal) return;
-		const pending = tree.currentRunByRuntime.get(runtimeId);
-		const run = pending && !isTerminal(pending.status) ? pending : this.createRun(tree, runtimeId);
+		const pending = parentToolCallId
+			? tree.runs.findLast((run) =>
+				run.runtimeId === runtimeId && run.parentToolCallId === parentToolCallId)
+			: tree.currentRunByRuntime.get(runtimeId) ?? this.latestRun(tree, runtimeId);
+		const run = pending ?? this.createRun(tree, runtimeId);
 		run.provisional = false;
 		run.confirmed = true;
 		run.liveProof = true;
@@ -620,7 +643,8 @@ export class SubagentsPanel {
 		run.status = terminal;
 		// A closed run releases its runtime slot: a later raw frame opens a fresh
 		// provisional run instead of reopening this one.
-		tree.currentRunByRuntime.delete(runtimeId);
+		if (tree.currentRunByRuntime.get(runtimeId) === run)
+			tree.currentRunByRuntime.delete(runtimeId);
 		// Unclosed calls are UNKNOWN, never success — no end event confirmed them.
 		for (const action of run.actions) if (action.status === "running") action.status = "unknown";
 		this.noteActivity(tree, run);
@@ -633,13 +657,17 @@ export class SubagentsPanel {
 	 * `recentTools` into actions.
 	 */
 	onProgress(data: unknown): void {
-		const tree = this.activeTree();
-		if (!tree) return;
 		const bag = fieldBag(data);
 		const progress = fieldBag(bag.progress);
 		const runtimeId = str(progress.id) || str(bag.id);
 		if (!runtimeId) return;
-		const run = this.activeRun(tree, runtimeId) ?? this.latestRun(tree, runtimeId);
+		const tree = this.eventTree(runtimeId, str(bag.parentToolCallId));
+		if (!tree) return;
+		const parentToolCallId = str(bag.parentToolCallId);
+		const run = parentToolCallId
+			? tree.runs.findLast((candidate) =>
+				candidate.runtimeId === runtimeId && candidate.parentToolCallId === parentToolCallId)
+			: this.activeRun(tree, runtimeId) ?? this.latestRun(tree, runtimeId);
 		if (!run) return;
 		let significant = false;
 		const sessionFile = str(bag.sessionFile);
@@ -671,24 +699,26 @@ export class SubagentsPanel {
 
 	/** Raw child frame: `{ id, event }` — the source of per-run tool actions. */
 	onEvent(data: unknown): void {
-		const tree = this.activeTree();
-		if (!tree) return;
+		if (this.disposed) return;
 		const bag = fieldBag(data);
 		const runtimeId = str(bag.id);
 		const frame = fieldBag(bag.event);
 		const type = str(frame.type);
 		const toolCallId = str(frame.toolCallId);
 		if (!runtimeId || !toolCallId) return;
+		const tree = this.eventTree(runtimeId, str(bag.parentToolCallId), toolCallId);
+		if (!tree) return;
 
 		if (type === "tool_execution_start") {
 			const toolName = sanitizeText(frame.toolName, TOOL_MAX);
 			if (!toolName) return;
-			let run = this.activeRun(tree, runtimeId);
+			let run = tree.actionOwner.get(ownerKey(runtimeId, toolCallId)) ?? this.activeRun(tree, runtimeId);
 			if (!run) {
 				run = this.createRun(tree, runtimeId);
 				run.provisional = true;
 				run.status = "running";
 				tree.currentRunByRuntime.set(runtimeId, run);
+				this.runtimeOwners.set(runtimeId, tree);
 				this.noteActivity(tree, run);
 			}
 			run.liveProof = true;
@@ -777,6 +807,7 @@ export class SubagentsPanel {
 			tree.scroll.dispose();
 		}
 		this.trees.clear();
+		this.runtimeOwners.clear();
 	}
 
 	// ── tree internals ──
@@ -784,6 +815,36 @@ export class SubagentsPanel {
 	private activeTree(): SessionTree | undefined {
 		if (this.disposed || !this.activeSessionId) return undefined;
 		return this.trees.get(this.activeSessionId);
+	}
+
+	/** Route evidence to its owner; conflicting identities never select the UI session. */
+	private eventTree(runtimeId: string, parentToolCallId?: string, toolCallId?: string): SessionTree | undefined {
+		if (this.disposed) return undefined;
+		let parentOwner: SessionTree | undefined;
+		let actionOwner: SessionTree | undefined;
+		let runtimeOwner: SessionTree | undefined;
+		let ambiguousRuntime = false;
+		for (const tree of this.trees.values()) {
+			if (parentToolCallId && (tree.parentToolCallIds.has(parentToolCallId) ||
+				tree.runs.some((run) => run.runtimeId === runtimeId && run.parentToolCallId === parentToolCallId))) {
+				if (parentOwner && parentOwner !== tree) return undefined;
+				parentOwner = tree;
+			}
+			if (toolCallId && tree.actionOwner.has(ownerKey(runtimeId, toolCallId))) {
+				if (actionOwner && actionOwner !== tree) return undefined;
+				actionOwner = tree;
+			}
+			if (tree.runs.some((run) => run.runtimeId === runtimeId)) {
+				if (runtimeOwner && runtimeOwner !== tree) ambiguousRuntime = true;
+				runtimeOwner = tree;
+			}
+		}
+		if (parentOwner && actionOwner && parentOwner !== actionOwner) return undefined;
+		if (parentOwner || actionOwner) return parentOwner ?? actionOwner;
+		const liveOwner = this.runtimeOwners.get(runtimeId);
+		if (liveOwner) return liveOwner;
+		if (ambiguousRuntime) return undefined;
+		return runtimeOwner ?? this.activeTree();
 	}
 
 	private ensureTree(sessionId: string): SessionTree {
@@ -795,6 +856,7 @@ export class SubagentsPanel {
 			byRunKey: new Map(),
 			currentRunByRuntime: new Map(),
 			actionOwner: new Map(),
+			parentToolCallIds: new Set(),
 			nextOrdinal: 1,
 			phase: "ready",
 			incomplete: false,
