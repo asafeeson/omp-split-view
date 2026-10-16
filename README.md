@@ -1,7 +1,10 @@
 # omp-split-view
 
-Split-view TUI plugin for [oh-my-pi](https://github.com/can1357/oh-my-pi).
-Native OMP port of [pi-split-view](https://github.com/Hugo-W/pi-split-view).
+Fork of [pi-split-view](https://github.com/Hugo-W/pi-split-view),
+adapted for [oh-my-pi](https://github.com/can1357/oh-my-pi)
+with an added subagent tracking panel showing run history,
+agent status, and recent tool calls.
+
 Requires OMP **18.11.1 / 18.x**; no build step.
 
 ```text
