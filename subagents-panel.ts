@@ -503,7 +503,7 @@ export class SubagentsPanel {
 		const generation = ++tree.generation;
 		tree.sessionFile = str(sessionManager.getSessionFile()) || undefined;
 		tree.artifactsDir = sessionManager.getArtifactsDir() ?? null;
-		for (const run of tree.dirtyRuns) this.touch(tree, run);
+		for (const run of tree.dirtyRuns) this.persistRun(tree, run);
 
 		let entries: readonly unknown[];
 		try {
@@ -613,7 +613,7 @@ export class SubagentsPanel {
 			tree.currentRunByRuntime.set(runtimeId, run);
 			this.runtimeOwners.set(runtimeId, tree);
 			this.noteActivity(tree, run);
-			this.touch(tree, run);
+			this.persistRun(tree, run);
 			return;
 		}
 
@@ -639,7 +639,7 @@ export class SubagentsPanel {
 		// Unclosed calls are UNKNOWN, never success — no end event confirmed them.
 		for (const action of run.actions) if (action.status === "running") action.status = "unknown";
 		this.noteActivity(tree, run);
-		this.touch(tree, run);
+		this.persistRun(tree, run);
 	}
 
 	/**
@@ -685,7 +685,7 @@ export class SubagentsPanel {
 				significant = true;
 			}
 		}
-		if (significant) this.touch(tree, run);
+		if (significant) this.persistRun(tree, run);
 	}
 
 	/** Raw child frame: `{ id, event }` — the source of per-run tool actions. */
@@ -714,7 +714,7 @@ export class SubagentsPanel {
 			}
 			run.liveProof = true;
 			this.addAction(tree, run, toolCallId, toolName, frame.args);
-			this.touch(tree, run);
+			this.persistRun(tree, run);
 			return;
 		}
 		if (type === "tool_execution_end") {
@@ -726,7 +726,7 @@ export class SubagentsPanel {
 			const isError = bool(frame.isError);
 			action.status = isError === undefined ? "unknown" : isError ? "error" : "success";
 			run.liveProof = true;
-			this.touch(tree, run);
+			this.persistRun(tree, run);
 			return;
 		}
 		// `tool_execution_update` (and any other frame) carries no panel state.
@@ -968,7 +968,7 @@ export class SubagentsPanel {
 	}
 
 	/** Persist one run and notify. A failed append is explicit incompleteness. */
-	private touch(tree: SessionTree, run: Run): void {
+	private persistRun(tree: SessionTree, run: Run): void {
 		tree.docVersion++;
 		tree.dirtyRuns.add(run);
 		const revision = run.revision + 1;
