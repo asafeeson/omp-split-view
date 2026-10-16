@@ -73,6 +73,8 @@ Consumers do **not** need `bun install`: native SDK/TUI modules come from OMP.
   unknown. The panel never shows agent thinking, messages or tool output.
   Late child events update their owning parent tree, not the selected session.
   Conflicting ownership evidence is not assigned to the current session.
+  Unsaved run state stays in memory and is retried when its parent is selected;
+  it is not crash-durable until the native journal append succeeds.
 - **Files**: newest-first read/write/seen/subagent paths, plus edit diff.
   Native inline read selectors are removed from file names; non-file URLs
   and internal URIs are not treated as filesystem paths.

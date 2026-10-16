@@ -154,6 +154,8 @@ interface SessionTree {
 	actionOwner: Map<string, Run>;
 	/** Parent task calls provide ownership evidence across session switches. */
 	parentToolCallIds: Set<string>;
+	/** Latest unsaved state stays with the parent even while it is inactive. */
+	dirtyRuns: Set<Run>;
 	nextOrdinal: number;
 	phase: PanelPhase;
 	phaseReason?: string;
@@ -513,6 +515,7 @@ export class SubagentsPanel {
 		const generation = ++tree.generation;
 		tree.sessionFile = str(sessionManager.getSessionFile()) || undefined;
 		tree.artifactsDir = sessionManager.getArtifactsDir() ?? null;
+		for (const run of tree.dirtyRuns) this.touch(tree, run);
 
 		let entries: readonly unknown[];
 		try {
@@ -857,6 +860,7 @@ export class SubagentsPanel {
 			currentRunByRuntime: new Map(),
 			actionOwner: new Map(),
 			parentToolCallIds: new Set(),
+			dirtyRuns: new Set(),
 			nextOrdinal: 1,
 			phase: "ready",
 			incomplete: false,
@@ -978,6 +982,7 @@ export class SubagentsPanel {
 	/** Persist one run and notify. A failed append is explicit incompleteness. */
 	private touch(tree: SessionTree, run: Run): void {
 		tree.docVersion++;
+		tree.dirtyRuns.add(run);
 		const revision = run.revision + 1;
 		let stored = false;
 		try {
@@ -987,6 +992,7 @@ export class SubagentsPanel {
 		}
 		if (stored) {
 			run.revision = revision;
+			tree.dirtyRuns.delete(run);
 		} else {
 			tree.incomplete = true;
 			if (tree.phase === "ready") tree.phase = "partial";

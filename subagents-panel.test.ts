@@ -329,3 +329,41 @@ test("parent call evidence distinguishes shared runtime IDs across sessions", as
 	expect(lineWith(previous, "tool1")).toContain("error");
 	harness.panel.dispose();
 });
+
+test.each(["reject", "throw"] as const)(
+	"dirty snapshots survive %s and persist when their parent becomes active again",
+	async (failure) => {
+		const entries: unknown[] = [];
+		const first = makeHarness(entries).ctx;
+		const second = makeHarness([], "s2").ctx;
+		let activeSessionId = "s1";
+		let failing = true;
+		const panel = new SubagentsPanel((owner, data) => {
+			if (owner !== activeSessionId) return false;
+			if (failing) {
+				if (failure === "throw") throw new Error("journal unavailable");
+				return false;
+			}
+			entries.push({ type: "custom", customType: SUBAGENT_SNAPSHOT_TYPE, data });
+			return true;
+		}, () => {}, JSON.stringify);
+		await panel.activate(first);
+		panel.onLifecycle({ id: "dirty", agent: "RecoveredAgent", status: "started" });
+		panel.onEvent(start("dirty", 1));
+		activeSessionId = "s2";
+		await panel.activate(second);
+		failing = false;
+		panel.onEvent(end("dirty", 1, true));
+		panel.onLifecycle({ id: "dirty", status: "completed" });
+		activeSessionId = "s1";
+		await panel.activate(first);
+		panel.dispose();
+
+		const restored = makeHarness(entries);
+		await restored.panel.activate(restored.ctx);
+		const lines = restored.panel.render(THEME, 100, 12);
+		expect(lineWith(lines, "RecoveredAgent")).toContain("completed");
+		expect(lineWith(lines, "tool1")).toContain("error");
+		restored.panel.dispose();
+	},
+);

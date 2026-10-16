@@ -1274,6 +1274,8 @@ export default function (pi: ExtensionAPI) {
 	const reconstruct = (ctx: ExtensionContext) => {
 		// Newest context first: the widget factory and the layout layer read
 		// `currentContext` for the live theme the moment either first renders.
+		currentContext = ctx;
+		void subagentsPanel!.activate(ctx);
 		ensureWidget(ctx);
 		thinking.reset();
 		toolsBy.clear();
@@ -1352,15 +1354,14 @@ export default function (pi: ExtensionAPI) {
 		filesOn = cfg.files;
 		subagentsOn = cfg.subagents;
 		trimResponse = cfg.trimResponse;
-		void subagentsPanel!.activate(ctx);
 		reconstruct(ctx);
 		if (ctx.mode === "tui") reconcileLayout(ctx.ui.theme);
 	});
 	// Subagent history spans every branch; ordinary panels keep their existing
 	// branch reconstruction behavior.
-	pi.on("session_switch", (_e, ctx) => { void subagentsPanel!.activate(ctx); reconstruct(ctx); });
-	pi.on("session_branch", (_e, ctx) => { void subagentsPanel!.activate(ctx); reconstruct(ctx); });
-	pi.on("session_tree", (_e, ctx) => { void subagentsPanel!.activate(ctx); reconstruct(ctx); });
+	pi.on("session_switch", (_e, ctx) => reconstruct(ctx));
+	pi.on("session_branch", (_e, ctx) => reconstruct(ctx));
+	pi.on("session_tree", (_e, ctx) => reconstruct(ctx));
 
 	// Thinking stream.
 	pi.on("message_update", (event) => {
