@@ -37,6 +37,7 @@ import {
 	type ToolMode as ToolModeCfg,
 } from "./ui-panels-config.ts";
 import { SUBAGENT_SNAPSHOT_TYPE, SubagentsPanel } from "./subagents-panel.ts";
+import { fieldBag, themeFingerprint } from "./panel-utils.ts";
 import {
 	getNativeRegions,
 	initLayoutManager,
@@ -100,20 +101,10 @@ let bandHeight = 14;
  * persisted as toolsWidthPct; session-local, only /split-save writes it). */
 let toolsWidthPct = 35;
 
-function themeFingerprint(theme: Theme): string {
-	return [
-		theme.fg("border", "x"),
-		theme.fg("accent", "x"),
-		theme.fg("muted", "x"),
-		theme.fg("thinkingText", "x"),
-		theme.fg("toolOutput", "x"),
-		theme.fg("success", "x"),
-		theme.fg("error", "x"),
-		theme.fg("warning", "x"),
-		theme.fg("dim", "x"),
-		theme.fg("text", "x"),
-	].join("|");
-}
+const SPLIT_THEME_COLORS = [
+	"border", "accent", "muted", "thinkingText", "toolOutput",
+	"success", "error", "warning", "dim", "text",
+] as const;
 
 // ─── thinking buffer ─────────────────────────────────────────────────────────
 
@@ -589,10 +580,6 @@ let filesVersion = 0;
 /** Non-file target prefix (URL, `artifact://`, `skill://`, MCP resource). */
 const SCHEME_URL = /^[a-z][a-z0-9+.-]*:\/\//i;
 
-/** Field view of an `unknown` tool payload (handler inputs are untyped). */
-function fieldBag(value: unknown): Record<string, unknown> {
-	return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-}
 
 /**
  * Native `read` embeds its selector inline in `path` (`notes.txt:450-455`,
@@ -1121,7 +1108,7 @@ function reconcileLayout(theme: Theme): void {
 			responseTheme = liveTheme;
 			responseDoc.invalidate();
 		}
-		const fingerprint = themeFingerprint(liveTheme);
+		const fingerprint = themeFingerprint(liveTheme, SPLIT_THEME_COLORS);
 		if (fingerprint !== panelFingerprint) {
 			panelFingerprint = fingerprint;
 			const options = {

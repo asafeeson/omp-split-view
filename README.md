@@ -158,6 +158,8 @@ bun test
 helpers, not independently discovered extensions. Host packages are optional
 peers and pinned development dependencies, preventing a consumer install
 from fetching a second copy of the agent/native runtime.
+`panel-utils.ts` shares payload field access and palette-aware theme
+fingerprints; each renderer still declares only the colors it uses.
 
 ## Отчёт об адаптации
 

@@ -35,6 +35,7 @@ import { loadSessionFile, type SessionLoadResult } from "@oh-my-pi/pi-coding-age
 import { ScrollView, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import * as path from "node:path";
+import { fieldBag, themeFingerprint } from "./panel-utils.ts";
 
 /** Native custom-entry type holding one run's bounded snapshot. */
 export const SUBAGENT_SNAPSHOT_TYPE = "split-view:subagent-run";
@@ -183,10 +184,6 @@ interface SessionTree {
 	bodyHeight: number;
 }
 
-/** Field view of an untyped payload (channel data and journal records). */
-function fieldBag(value: unknown): Record<string, unknown> {
-	return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-}
 
 function str(value: unknown): string {
 	return typeof value === "string" ? value : "";
@@ -232,18 +229,9 @@ function padTo(line: string, width: number): string {
 	return line + " ".repeat(Math.max(0, width - visibleWidth(line)));
 }
 
-function themeFingerprint(theme: Theme): string {
-	return [
-		theme.fg("border", "x"),
-		theme.fg("accent", "x"),
-		theme.fg("muted", "x"),
-		theme.fg("dim", "x"),
-		theme.fg("text", "x"),
-		theme.fg("success", "x"),
-		theme.fg("error", "x"),
-		theme.fg("warning", "x"),
-	].join("|");
-}
+const SUBAGENT_THEME_COLORS = [
+	"border", "accent", "muted", "dim", "text", "success", "error", "warning",
+] as const;
 
 function makeScroll(theme: Theme, height: number): ScrollView {
 	return new ScrollView([], {
@@ -774,7 +762,7 @@ export class SubagentsPanel {
 		const framed = h >= 4;
 		const bodyHeight = framed ? h - FRAME_ROWS : h;
 		tree.bodyHeight = bodyHeight;
-		const fingerprint = themeFingerprint(theme);
+		const fingerprint = themeFingerprint(theme, SUBAGENT_THEME_COLORS);
 		if (tree.scrollTheme !== fingerprint) {
 			tree.scroll.dispose();
 			tree.scroll = makeScroll(theme, bodyHeight);

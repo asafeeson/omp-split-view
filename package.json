@@ -20,6 +20,7 @@
 	"files": [
 		"split-view.ts",
 		"subagents-panel.ts",
+		"panel-utils.ts",
 		"layout-manager.ts",
 		"ui-panels-config.ts",
 		"README.md",
