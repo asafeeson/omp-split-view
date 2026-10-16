@@ -555,9 +555,6 @@ export class SubagentsPanel {
 		for (const run of tree.runs) {
 			if (run.sessionFile) fileUse.set(run.sessionFile, (fileUse.get(run.sessionFile) ?? 0) + 1);
 		}
-		for (const run of tree.runs) {
-			if (run.sessionFile && (fileUse.get(run.sessionFile) ?? 0) > 1) run.sharedChild = true;
-		}
 
 		const pending: { run: Run; file: string; candidate: boolean }[] = [];
 		for (const run of tree.runs) {
@@ -574,8 +571,11 @@ export class SubagentsPanel {
 				continue;
 			}
 			// Native executor writes `<artifactsDir>/<id>.jsonl` for spawned agents.
-			pending.push({ run, file: path.join(dir, `${run.runtimeId}.jsonl`), candidate: true });
+			const file = path.join(dir, `${run.runtimeId}.jsonl`);
+			fileUse.set(file, (fileUse.get(file) ?? 0) + 1);
+			pending.push({ run, file, candidate: true });
 		}
+		for (const item of pending) item.run.sharedChild = (fileUse.get(item.file) ?? 0) > 1;
 
 		if (pending.length > 0) {
 			tree.phase = "loading";
@@ -1063,10 +1063,13 @@ export class SubagentsPanel {
 	 */
 	private restoreLegacyResults(tree: SessionTree, entries: readonly unknown[]): void {
 		for (const result of collectLegacyResults(entries)) {
-			// Correlate by parent tool call id first, then by item index, then only
-			// for a single identity-less run of that runtime id: a result never
-			// creates a second node for an already known run.
-			const sameRuntime = tree.runs.filter((run) => run.runtimeId === result.runtimeId);
+			// Missing metadata may be filled, but conflicting parent calls or
+			// item indexes are evidence of distinct runs, never a fallback match.
+			const sameRuntime = tree.runs.filter((run) =>
+				run.runtimeId === result.runtimeId &&
+				(!result.parentToolCallId || !run.parentToolCallId ||
+					run.parentToolCallId === result.parentToolCallId) &&
+				(result.index === undefined || run.index === undefined || run.index === result.index));
 			const known =
 				(result.parentToolCallId
 					? sameRuntime.find((run) => run.parentToolCallId === result.parentToolCallId)

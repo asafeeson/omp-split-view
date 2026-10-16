@@ -75,6 +75,8 @@ Consumers do **not** need `bun install`: native SDK/TUI modules come from OMP.
   Conflicting ownership evidence is not assigned to the current session.
   Unsaved run state stays in memory and is retried when its parent is selected;
   it is not crash-durable until the native journal append succeeds.
+  Legacy task results with different parent calls remain distinct, even when
+  runtime ID/index repeat; shared child history is not guessed per follow-up.
 - **Files**: newest-first read/write/seen/subagent paths, plus edit diff.
   Native inline read selectors are removed from file names; non-file URLs
   and internal URIs are not treated as filesystem paths.

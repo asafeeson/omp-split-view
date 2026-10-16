@@ -1,11 +1,14 @@
 /**
  * Model tests for `subagents-panel.ts`. They exercise the panel model directly
- * (no TUI, no host registries, no child session IO): run identity, the bounded
+ * (no TUI or host registries): run identity, the bounded
  * per-run window, agent/action status independence, provisional adoption,
  * pause/live viewport behaviour, snapshot persistence shape, whole-session
  * restore and damaged-record handling.
  */
 import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { SUBAGENT_SNAPSHOT_TYPE, SubagentsPanel } from "./subagents-panel.ts";
@@ -367,3 +370,65 @@ test.each(["reject", "throw"] as const)(
 		restored.panel.dispose();
 	},
 );
+
+test("legacy follow-up results preserve each parent call's terminal state", async () => {
+	const entries = [
+		{ type: "message", message: { role: "toolResult", toolName: "task", toolCallId: "parent-one",
+			details: { results: [{ id: "shared", index: 0, agent: "SameAgent", exitCode: 0 }] } } },
+		{ type: "message", message: { role: "toolResult", toolName: "task", toolCallId: "parent-two",
+			details: { results: [{ id: "shared", index: 0, agent: "SameAgent", exitCode: 1 }] } } },
+	];
+	const harness = makeHarness(entries);
+	await harness.panel.activate(harness.ctx);
+	let lines = harness.panel.render(THEME, 100, 12);
+	expect(lineWith(lines, "#1")).toContain("completed");
+	expect(lineWith(lines, "#2")).toContain("failed");
+	await harness.panel.activate(harness.ctx);
+	lines = harness.panel.render(THEME, 100, 12);
+	expect(lineWith(lines, "#1")).toContain("completed");
+	expect(lineWith(lines, "#2")).toContain("failed");
+	expect(lines.join("\n")).not.toContain("#3");
+	harness.panel.dispose();
+});
+
+test("shared legacy child history is not copied into separate follow-up runs", async () => {
+	const directory = mkdtempSync(join(tmpdir(), "omp-shared-child-"));
+	const parentFile = join(directory, "parent.jsonl");
+	const timestamp = "2026-01-01T00:00:00.000Z";
+	const harness = makeHarness();
+	try {
+		const entries = [
+			{ type: "session", version: 3, id: "child", timestamp, cwd: directory, parentSession: parentFile },
+			{ type: "message", id: "m1", parentId: null, timestamp, message: {
+				role: "assistant", api: "openai-completions", provider: "smoke", model: "test",
+				content: [{ type: "toolCall", id: "unattributed", name: "sharedOnlyTool", arguments: {} }],
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: "toolUse", timestamp: 0,
+			} },
+		];
+		writeFileSync(join(directory, "shared.jsonl"), entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+		const ctx = {
+			sessionManager: {
+				getSessionId: () => "s1",
+				getSessionFile: () => parentFile,
+				getArtifactsDir: () => directory,
+				getEntries: () => [
+					{ type: "message", message: { role: "toolResult", toolName: "task", toolCallId: "p1",
+						details: { results: [{ id: "shared", index: 0, agent: "SameAgent", exitCode: 0 }] } } },
+					{ type: "message", message: { role: "toolResult", toolName: "task", toolCallId: "p2",
+						details: { results: [{ id: "shared", index: 0, agent: "SameAgent", exitCode: 1 }] } } },
+				],
+			},
+		} as unknown as ExtensionContext;
+		await harness.panel.activate(ctx);
+		const lines = harness.panel.render(THEME, 120, 12);
+		expect(lineWith(lines, "#1")).toContain("completed");
+		expect(lineWith(lines, "#2")).toContain("failed");
+		expect(lines.join("\n")).not.toContain("sharedOnlyTool");
+		expect(lines.join("\n")).toContain("partial");
+	} finally {
+		harness.panel.dispose();
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
