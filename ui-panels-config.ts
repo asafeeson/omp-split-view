@@ -1,6 +1,9 @@
 /**
  * ui-panels-config.ts — shared persistent config for the unified split-view
- * extension (thinking / tools / files panels). Stored at ~/.pi/agent/ui-panels.json.
+ * extension (thinking / tools / files panels). Stored in the active oh-my-pi
+ * agent directory (`<agent dir>/ui-panels.json`), resolved through the native
+ * `getAgentDir()` so it follows `PI_CODING_AGENT_DIR` and named profiles
+ * (`~/.omp/agent`, or `~/.omp/profiles/<name>/agent` under a profile).
  *
  * Defaults: thinking and tools default ON (when `split` is on); files defaults OFF.
  * `toolMode` defaults to "compact".
@@ -8,15 +11,17 @@
  * IMPORTANT: the JSON on disk is a TEMPLATE of startup defaults, NOT live
  * state. Toggle commands only mutate in-process state (session-local);
  * only /split-save writes the current layout back to disk. This keeps
- * concurrent pi windows from clobbering each other's panels.
+ * concurrent agent windows from clobbering each other's panels.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@oh-my-pi/pi-utils";
 
-const CONFIG_PATH = path.join(homedir(), ".pi", "agent", "ui-panels.json");
+// The path is composed at each read/write rather than cached at module load:
+// the native dir resolver is re-pointed when the agent dir changes (named
+// profile activation, `setAgentDir`), so a frozen path would keep reading and
+// writing the previous profile's directory.
 
 export type ToolMode = "compact" | "full";
 
@@ -29,9 +34,11 @@ export interface UiPanelsConfig {
 	tools?: boolean;
 	/** Files side panel (fullscreen dock or regular overlay). */
 	files?: boolean;
+	/** Independent subagents panel in the right dock. */
+	subagents?: boolean;
 	/** Tool panel detail mode. */
 	toolMode?: ToolMode;
-	/** Panel C shows response-only (own-rendered) instead of pi's full transcript. */
+	/** Panel C shows response-only (own-rendered) instead of the full transcript. */
 	trimResponse?: boolean;
 	/** Top band height in rows (6–40, default 20). */
 	bandHeight?: number;
@@ -53,6 +60,7 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 	thinking: boolean;
 	tools: boolean;
 	files: boolean;
+	subagents: boolean;
 	toolMode: ToolMode;
 	trimResponse: boolean;
 	bandHeight: number;
@@ -87,6 +95,7 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 		thinking: split && boolOr(root.thinking, true),
 		tools: split && boolOr(root.tools, true),
 		files: boolOr(root.files, false),
+		subagents: boolOr(root.subagents, false),
 		toolMode: tm,
 		trimResponse: boolOr(root.trimResponse, false),
 		bandHeight,
@@ -98,7 +107,9 @@ export function loadUiPanelsConfig(): UiPanelsConfig {
 	try {
 		// SV-12: validate the parsed root is a plain object before casting;
 		// JSON null, arrays or primitives fall back to defaults.
-		const parsed: unknown = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+		const parsed: unknown = JSON.parse(
+			readFileSync(path.join(getAgentDir(), "ui-panels.json"), "utf8"),
+		);
 		if (
 			typeof parsed !== "object" ||
 			parsed === null ||
@@ -112,22 +123,17 @@ export function loadUiPanelsConfig(): UiPanelsConfig {
 }
 
 /** Persist the config. SV-13: returns whether the write actually succeeded
- * instead of swallowing the error, so callers can report the real outcome. */
+ * instead of swallowing the error, so callers can report the real outcome.
+ * Creates the agent directory when it does not exist yet (first run before
+ * any other config file has been written). */
 export function saveUiPanelsConfig(cfg: UiPanelsConfig): boolean {
 	try {
-		writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+		const file = path.join(getAgentDir(), "ui-panels.json");
+		mkdirSync(path.dirname(file), { recursive: true });
+		writeFileSync(file, JSON.stringify(cfg, null, 2));
 		return true;
 	} catch {
 		/* never break the extension on a config write failure */
 		return false;
 	}
-}
-
-/**
- * This module is a shared utility imported by split-view.ts. pi auto-discovers
- * every *.ts file in this directory as an extension and requires a default
- * factory export, so expose a no-op one here.
- */
-export default function (_pi: ExtensionAPI) {
-	/* no-op: this is a shared config module, not a real extension */
 }
