@@ -19,6 +19,7 @@
 	],
 	"files": [
 		"split-view.ts",
+		"files-activity.ts",
 		"subagents-panel.ts",
 		"panel-utils.ts",
 		"layout-manager.ts",

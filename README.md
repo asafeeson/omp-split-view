@@ -164,6 +164,18 @@ from fetching a second copy of the agent/native runtime.
 `panel-utils.ts` shares payload field access and palette-aware theme
 fingerprints; each renderer still declares only the colors it uses.
 
+`files-activity.ts` owns Files history, Last Edit, branch reconstruction, and
+both dock and compact-summary rendering. `split-view.ts` supplies native events,
+the active cwd/branch, theme and allocated geometry; it does not manage file
+revisions or edit-result ownership. Tests exercise the module's rendered views
+with real temporary files; the native extension smoke remains in
+`split-view.test.ts`.
+
+Files history records attempted tool references, not confirmed successful
+changes. Live Last Edit results must belong to the newest edit call; branch
+reconstruction instead restores the last recorded edit result and does not
+replay previews or child frames. This refactor preserves those distinctions.
+
 ## Отчёт об адаптации
 
 **Причина первой ошибки:** upstream импортировал `generateDiffString` из

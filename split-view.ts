@@ -7,14 +7,9 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
-import { renderDiff } from "@oh-my-pi/pi-tui/chrome";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { UserMessageComponent } from "@oh-my-pi/pi-tui/chat/user-message";
 import { textContent } from "@oh-my-pi/pi-tui/chat/transcript-entry";
-import { getEditInputPaths } from "@oh-my-pi/pi-tui/tools/edit";
-import { parseSel } from "@oh-my-pi/pi-coding-agent/tools/read-selector";
-import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
-import { editDiffString } from "@oh-my-pi/pi-natives";
 import {
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
@@ -37,6 +32,7 @@ import {
 	type ToolMode as ToolModeCfg,
 } from "./ui-panels-config.ts";
 import { SUBAGENT_SNAPSHOT_TYPE, SubagentsPanel } from "./subagents-panel.ts";
+import { FilesActivity } from "./files-activity.ts";
 import { fieldBag, themeFingerprint } from "./panel-utils.ts";
 import {
 	getNativeRegions,
@@ -45,9 +41,6 @@ import {
 	isLayoutLayerActive,
 	resetLayoutManager,
 } from "./layout-manager.ts";
-import { existsSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import * as path from "node:path";
 
 const WIDGET_KEY = "split-view";
 const MAX_TOOLS = 60;
@@ -59,8 +52,6 @@ const MAX_LINES = 400;
 // (its key changes each time). Render only its recent suffix so per-flush
 // work is bounded even for one giant paragraph.
 const MAX_TAIL_CHARS = 2000;
-const MAX_FILES = 500;
-const MAX_WIDGET_NAMES = 3;
 const MIN_TERM_WIDTH = 90;
 const MAX_TOOL_OUTPUT_LINES = 20;
 // OracleSpec body window: hard cap on FINAL VISUAL rows rendered by band
@@ -69,8 +60,6 @@ const MAX_BODY_ROWS = 96;
 // Hard cap on raw chars processed per logical line (giant-line guard).
 const MAX_LINE_CHARS = 600;
 
-/** Legend shown at the bottom of the files list. */
-const LEGEND = "r read · w write · s seen(bash) · a subagent";
 
 // ─── module-lifetime state ───────────────────────────────────────────────────
 
@@ -567,217 +556,7 @@ function toolLines(theme: Theme, width: number): string[] {
 
 const toolsVersion = () => toolsVersionCounter;
 
-// ─── files buffer ────────────────────────────────────────────────────────────
-
-type FileOp = "r" | "w" | "s" | "a";
-
-interface FileEntry {
-	path: string;
-	ops: string;
-	count: number;
-}
-const files = new Map<string, FileEntry>();
-let filesVersion = 0;
-
-/** Non-file target prefix (URL, `artifact://`, `skill://`, MCP resource). */
-const SCHEME_URL = /^[a-z][a-z0-9+.-]*:\/\//i;
-
-
-/**
- * Native `read` embeds its selector inline in `path` (`notes.txt:450-455`,
- * `notes.txt:-5`, `notes.txt:raw`); the files panel tracks the underlying file.
- * A trailing chunk is peeled off only when the native selector parser accepts
- * it as a selector (an unrecognized chunk is part of the path/filename).
- */
-function filePathFromRead(raw: unknown): string {
-	if (typeof raw !== "string" || !raw) return "";
-	const i = raw.lastIndexOf(":");
-	if (i <= 0 || i === raw.length - 1) return raw;
-	let kind: string;
-	try {
-		kind = parseSel(raw.slice(i + 1)).kind;
-	} catch {
-		return raw;
-	}
-	return kind === "none" ? raw : raw.slice(0, i);
-}
-
-function pathsFrom(toolName: string, input: unknown): { abs: string; op: FileOp }[] {
-	const bag = fieldBag(input);
-	const out: { abs: string; op: FileOp }[] = [];
-	const add = (v: unknown, op: FileOp, unconditional: boolean) => {
-		if (typeof v !== "string" || !v || SCHEME_URL.test(v)) return;
-		try {
-			const abs = resolveToCwd(v, currentContext?.cwd ?? process.cwd());
-			if (!unconditional && (!existsSync(abs) || !statSync(abs).isFile())) return;
-			out.push({ abs, op });
-		} catch {
-			/* skip */
-		}
-	};
-	if (toolName === "bash") {
-		const cmd = typeof bag.command === "string" ? bag.command : "";
-		for (const raw of cmd.split(/\s+/)) {
-			const tok = raw.replace(/^[("'`]+/, "").replace(/[)"'`;:,]+$/, "");
-			if (!tok || tok.startsWith("-") || /[|&><`$*?]/.test(tok)) continue;
-			try {
-				const abs = resolveToCwd(tok, currentContext?.cwd ?? process.cwd());
-				if (existsSync(abs) && statSync(abs).isFile()) out.push({ abs, op: "s" });
-			} catch {
-				/* skip */
-			}
-		}
-		return out;
-	}
-	if (toolName === "read") {
-		add(filePathFromRead(bag.path), "r", true);
-		return out;
-	}
-	if (toolName === "write") {
-		add(bag.path, "w", true);
-		return out;
-	}
-	if (toolName === "edit") {
-		// The native edit tool has ONE schema per session mode: replace/patch carry
-		// `path` (patch entries may also `rename` a target), while
-		// hashline/apply_patch/sloppy carry a freeform patch in `input` whose
-		// target paths come from the native parser.
-		add(bag.path, "w", true);
-		if (typeof bag.input === "string" && bag.input)
-			for (const target of getEditInputPaths(bag.input)) add(target, "w", true);
-		const edits: unknown[] = Array.isArray(bag.edits) ? bag.edits : [];
-		for (const entry of edits) {
-			if (!entry || typeof entry !== "object") continue;
-			if ("rename" in entry && typeof entry.rename === "string") add(entry.rename, "w", true);
-		}
-		return out;
-	}
-	for (const key of ["path", "filePath", "file_path", "imagePath"]) add(bag[key], "r", false);
-	for (const key of ["paths", "files", "filePaths"]) {
-		const list = bag[key];
-		if (Array.isArray(list)) for (const v of list) add(v, "r", false);
-	}
-	return out;
-}
-
-/** Record one file with an op: newest-first, MAX_FILES-bounded (oldest evicted). */
-function recordPath(abs: string, op: FileOp): void {
-	const prev = files.get(abs);
-	if (prev) {
-		files.delete(abs);
-		prev.count++;
-		if (!prev.ops.includes(op)) prev.ops += op;
-		files.set(abs, prev);
-		return;
-	}
-	if (files.size >= MAX_FILES) {
-		const oldest = files.keys().next();
-		if (!oldest.done) files.delete(oldest.value);
-	}
-	files.set(abs, { path: abs, ops: op, count: 1 });
-}
-
-function record(toolName: string, input: unknown): void {
-	const seen = new Set<string>();
-	for (const { abs, op } of pathsFrom(toolName, input)) {
-		if (seen.has(abs)) continue;
-		seen.add(abs);
-		recordPath(abs, op);
-	}
-	filesVersion++;
-}
-
-function bumpFilesVersion(): void {
-	filesVersion++;
-}
-
-const recentEntries = (): FileEntry[] => [...files.values()].reverse();
-
-function displayPath(abs: string): string {
-	if (SCHEME_URL.test(abs)) return abs;
-	const rel = path.relative(currentContext?.cwd ?? process.cwd(), abs);
-	if (rel && !rel.startsWith("..")) return rel;
-	const home = homedir();
-	if (abs.startsWith(home + path.sep)) return `~${abs.slice(home.length)}`;
-	return abs;
-}
-
-function widgetLines(theme: Theme, width: number): string[] {
-	const entries = recentEntries();
-	if (entries.length === 0) return [];
-	const names = entries
-		.slice(0, MAX_WIDGET_NAMES)
-		.map((e) => path.basename(e.path));
-	const rest = entries.length - names.length;
-	let text = `📂 ${entries.length}`;
-	if (names.length) text += `  ${names.join(" · ")}`;
-	if (rest > 0) text += `  +${rest}`;
-	return [truncateToWidth(theme.fg("dim", text), width)];
-}
-
-// ─── edit-diff buffer ────────────────────────────────────────────────────────
-
-/** Raw diff stays theme-independent; only the latest edit call owns its preview. */
-const editDiff = {
-	path: "" as string,
-	diff: "" as string,
-	version: 0,
-};
-let editPreviewCallId: string | undefined;
-
-function setEditDiff(p: string, diff: string): void {
-	editDiff.path = p && !SCHEME_URL.test(p)
-		? resolveToCwd(p, currentContext?.cwd ?? process.cwd()) : p;
-	editDiff.diff = diff;
-	editDiff.version++;
-}
-
-function clearEditDiff(): void {
-	editPreviewCallId = undefined;
-	editDiff.path = "";
-	editDiff.diff = "";
-	editDiff.version++;
-}
-
-/**
- * Diff + display path a not-yet-executed native `edit` call declares in its
- * args. The tool has ONE schema per session mode: `path` + `old_string`/
- * `new_string` (replace), `path` + `edits[].diff` (patch), or a freeform patch
- * in `input` (hashline / apply_patch / sloppy), whose target paths the native
- * parser names. Modes that carry a patch verbatim are shown verbatim — the
- * preview never reads a file, and the result replaces it authoritatively.
- */
-function editCallPreview(input: unknown): { path: string; diff: string } | null {
-	const bag = fieldBag(input);
-	const path = typeof bag.path === "string" ? bag.path : "";
-	let diff = "";
-	if (typeof bag.input === "string" && bag.input.trim()) {
-		diff = bag.input;
-	} else if (typeof bag.old_string === "string" || typeof bag.new_string === "string") {
-		const oldText = typeof bag.old_string === "string" ? bag.old_string : "";
-		const newText = typeof bag.new_string === "string" ? bag.new_string : "";
-		if (oldText !== newText) diff = editDiffString(oldText, newText, path || null).diff;
-	} else {
-		const edits: unknown[] = Array.isArray(bag.edits) ? bag.edits : [];
-		const parts: string[] = [];
-		for (const entry of edits) {
-			if (!entry || typeof entry !== "object") continue;
-			if ("diff" in entry && typeof entry.diff === "string" && entry.diff) parts.push(entry.diff);
-		}
-		diff = parts.join("\n");
-	}
-	if (!diff) return null;
-	const targets = typeof bag.input === "string" ? getEditInputPaths(bag.input) : [];
-	return { path: path || targets[0] || "", diff };
-}
-
-/** Diff + display path of a native `edit` result (`details` is untyped). */
-function editResultDiff(details: unknown): { path: string; diff: string } | null {
-	if (!details || typeof details !== "object") return null;
-	if (!("diff" in details) || typeof details.diff !== "string" || !details.diff) return null;
-	const path = "path" in details && typeof details.path === "string" ? details.path : "";
-	return { path, diff: details.diff };
-}
+let filesActivity: FilesActivity;
 
 // ─── shared helpers ──────────────────────────────────────────────────────────
 
@@ -934,152 +713,6 @@ class RecentBody {
 	dispose(): void {}
 }
 
-// ─── files panel (list + edit-diff subpanel) ──────────────────────────────────
-
-class FilesPanel {
-	private cacheKey = "";
-	private cacheLines: string[] = [];
-
-	constructor(
-		private theme: Theme,
-		/** Current allocated screen height. */
-		private heightProvider?: () => number,
-	) {}
-
-
-	render(width: number, allocatedHeight?: number): string[] {
-		const height = allocatedHeight ?? (this.heightProvider?.() || termHeight || recentEntries().length + 12);
-		// Cache key MUST include height: a height-only terminal resize changes
-		// the list/diff row split without bumping filesVersion or width.
-		const key = `${filesVersion}|${editDiff.version}|${width}|${height}`;
-		if (key === this.cacheKey) return this.cacheLines;
-
-		const th = this.theme;
-		const inner = Math.max(1, width - 2);
-		const pad = (s: string) =>
-			s + " ".repeat(Math.max(0, inner - visibleWidth(s)));
-		const row = (c: string) =>
-			th.fg("border", "│") + pad(truncateToWidth(c, inner)) + th.fg("border", "│");
-
-		const entries = recentEntries();
-		// Reserve the bottom half for the edit diff (min 2 list rows).
-		const half = Math.max(6, Math.floor(height / 2));
-		const listRows = Math.max(2, half - 4);
-		// SV-06: exact row accounting so the bottom border lands on the last
-		// allocated row. Fixed chrome is 6 rows (top, title, list separator,
-		// diff separator, diff title, bottom border) and the list always pads
-		// to listRows, so the diff section gets exactly what remains. Without
-		// this a short diff left an unframed hole between the panel and the
-		// viewport bottom (the old diffRows budget was never padded when a diff
-		// existed, only when it did not).
-		const diffRows = Math.max(0, height - listRows - 6);
-
-		const meta = (e: FileEntry) =>
-			th.fg("muted", `${e.ops}${e.count > 1 ? `×${e.count}` : ""}`);
-
-		const rows: { line: string; files: number }[] = [];
-		let i = 0;
-		while (i < entries.length) {
-			const dir = path.dirname(entries[i].path);
-			let j = i;
-			while (j < entries.length && path.dirname(entries[j].path) === dir) j++;
-			const run = entries.slice(i, j);
-			if (run.length > 3) {
-				const label = displayPath(dir);
-				rows.push({
-					line: row(` ${th.fg("accent", label === "." ? "./" : `${label}/`)}`),
-					files: 0,
-				});
-				for (const e of run)
-					rows.push({
-						line: row(`   ${meta(e)} ${th.fg("text", path.basename(e.path))}`),
-						files: 1,
-					});
-			} else {
-				for (const e of run)
-					rows.push({
-						line: row(` ${meta(e)} ${th.fg("text", path.basename(e.path))}`),
-						files: 1,
-					});
-			}
-			i = j;
-		}
-
-		const body: string[] = [];
-		let filesShown = 0;
-		for (const r of rows) {
-			if (body.length >= listRows - 2) break;
-			body.push(r.line);
-			filesShown += r.files;
-		}
-		if (body.length === 0 && entries.length === 0)
-			body.push(row(` ${th.fg("dim", "No files touched yet")}`));
-		if (entries.length > filesShown)
-			body.push(row(` ${th.fg("dim", `… +${entries.length - filesShown} more`)}`));
-		body.push(row(` ${th.fg("dim", LEGEND)}`));
-		while (body.length < listRows) body.push(row(""));
-
-		// ── edit-diff subpanel ──
-		const diffBody: string[] = [];
-		diffBody.push(th.fg("border", `├${"─".repeat(inner)}┤`));
-		// SV-05: truncate the title by DISPLAY COLUMNS (wide/CJK/emoji paths)
-		// and compute the fill from the truncated title's visible width, so the
-		// title can never overrun the fill and collide with the right border.
-		// Budget: leading " ✎ " + trailing " " around the path text.
-		const title = editDiff.path
-			? th.fg("accent", ` ✎ ${truncateToWidth(displayPath(editDiff.path), inner - 4)} `)
-			: th.fg("dim", " Last Edit ");
-		const titleFill = "─".repeat(
-			Math.max(0, inner - visibleWidth(title)),
-		);
-		diffBody.push(
-			th.fg("border", "│") +
-				title +
-				th.fg("border", titleFill) +
-				th.fg("border", "│"),
-		);
-
-		if (editDiff.diff) {
-			// Native diff renderer: parses the tool's compact numbered diff text
-			// (`+12|…`) and highlights context lines by the target file's language.
-			const rendered = renderDiff(editDiff.diff, {
-				filePath: editDiff.path || undefined,
-			}).split(/\r?\n/);
-			// SV-06: cap content one row below the pad target so the "… +N more"
-			// marker always fits; the section is then padded to diffRows so the
-			// frame closes on the last row.
-			const shown = rendered.slice(0, Math.max(0, diffRows - 1));
-			for (const l of shown) diffBody.push(row(` ${l}`));
-			if (rendered.length > shown.length && diffRows > 0)
-				diffBody.push(
-					row(` ${th.fg("dim", `… +${rendered.length - shown.length} more`)}`),
-				);
-			while (diffBody.length < diffRows + 2) diffBody.push(row(""));
-		} else {
-			if (diffRows > 0)
-				diffBody.push(row(` ${th.fg("dim", "No edit yet")}`));
-			while (diffBody.length < diffRows + 2) diffBody.push(row(""));
-		}
-
-		const out = [
-			th.fg("border", `╭${"─".repeat(inner)}╮`),
-			row(` ${th.fg("accent", `📂 Files (${entries.length})`)}`),
-			th.fg("border", `├${"─".repeat(inner)}┤`),
-			...body,
-			...diffBody,
-			th.fg("border", `╰${"─".repeat(inner)}╯`),
-		];
-		this.cacheKey = key;
-		this.cacheLines = out.slice(0, height);
-		return this.cacheLines;
-	}
-
-	invalidate(): void {
-		this.cacheKey = "";
-	}
-	dispose(): void {}
-}
-
 // ─── native OMP frame composition ─────────────────────────────────────────────
 
 let responseScrollView: ScrollView | null = null;
@@ -1101,7 +734,6 @@ function reconcileLayout(theme: Theme): void {
 	let panelFingerprint = "";
 	let thinkingPanel: ScrollView;
 	let toolPanel: ScrollView;
-	let filesPanel: FilesPanel;
 	let bodyRows = 1;
 	responseScrollView ??= new ScrollView(responseDoc, { height: 1, followTail: true });
 	setLayoutLayer((width, height) => {
@@ -1131,7 +763,6 @@ function reconcileLayout(theme: Theme): void {
 				liveTheme, line => line, w => toolLines(liveTheme, w),
 				toolsVersion, "No tools called yet", () => bodyRows,
 			), options);
-			filesPanel = new FilesPanel(liveTheme, () => termHeight);
 		}
 		termHeight = height;
 		const dockWidth = (filesOn || subagentsOn) && width >= MIN_TERM_WIDTH
@@ -1196,7 +827,7 @@ function reconcileLayout(theme: Theme): void {
 			else if (filesOn) fileRows = height;
 			const right: string[] = [];
 			if (subagentRows > 0) right.push(...subagentsPanel!.render(liveTheme, dockWidth, subagentRows));
-			if (fileRows > 0) right.push(...filesPanel!.render(dockWidth, fileRows));
+			if (fileRows > 0) right.push(...filesActivity.render(liveTheme, dockWidth, fileRows, currentContext?.cwd ?? process.cwd()));
 			return visible.map((line, row) => fit(line, mainWidth) + fit(right[row] ?? "", dockWidth));
 		}
 		return visible;
@@ -1205,6 +836,7 @@ function reconcileLayout(theme: Theme): void {
 // ─── wiring ──────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+	filesActivity = new FilesActivity();
 	subagentsPanel = new SubagentsPanel(
 		(parentSessionId, data) => {
 			if (currentContext?.sessionManager.getSessionId() !== parentSessionId)
@@ -1241,7 +873,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				render: width => {
 					if (!panelsActive()) return [];
-					const lines = widgetLines(ctx.ui.theme, width);
+					const lines = filesActivity.summary(ctx.ui.theme, width);
 					if (trimResponse && panelNotice) lines.push(truncateToWidth(
 						ctx.ui.theme.fg(panelNotice.type === "info" ? "muted" : panelNotice.type, panelNotice.text),
 						width,
@@ -1270,13 +902,12 @@ export default function (pi: ExtensionAPI) {
 		toolsBy.clear();
 		toolOrder.length = 0;
 		toolsVersionCounter++;
-		files.clear();
-		bumpFilesVersion();
-		clearEditDiff();
+		const branch = ctx.sessionManager.getBranch();
+		filesActivity.rebuild(branch, ctx.cwd);
 		rebuildResponseDoc(ctx);
 
 		const thoughts: string[] = [];
-		for (const entry of ctx.sessionManager.getBranch()) {
+		for (const entry of branch) {
 			if (entry.type !== "message") continue;
 			const msg = entry.message;
 			if (msg.role === "assistant") {
@@ -1287,7 +918,6 @@ export default function (pi: ExtensionAPI) {
 						// SV-17: rebuild the bounded tools buffer from the
 						// branch through the same ingest path live events use.
 						ingestToolCall(c.id, c.name, c.arguments);
-						record(c.name, c.arguments);
 					} catch {
 						/* skip */
 					}
@@ -1295,12 +925,6 @@ export default function (pi: ExtensionAPI) {
 				continue;
 			}
 			if (msg.role !== "toolResult") continue;
-			// Reconstruct the last edit diff from the persisted result details —
-			// the native edit tool reports the file it actually wrote.
-			if (msg.toolName === "edit") {
-				const result = editResultDiff(msg.details);
-				if (result) setEditDiff(result.path || editDiff.path, result.diff);
-			}
 			// SV-17: rebuild tool outputs from persisted results, correlated
 			// to their calls by toolCallId.
 			try {
@@ -1397,43 +1021,14 @@ export default function (pi: ExtensionAPI) {
 		if (anyPanelActive()) requestRender();
 	});
 
-	// Edit diff: preview from the call's own args, authoritative diff on result.
 	pi.on("tool_call", (event, ctx) => {
 		currentContext = ctx;
-		if (event.toolName !== "edit") {
-			// Still record files for non-edit tools (write/read/bash/grep...).
-			try {
-				record(event.toolName, event.input);
-			} catch {
-				/* skip */
-			}
-			bumpFilesVersion();
-			if (anyPanelActive()) requestRender();
-			return;
-		}
-		const input = event.input;
-		editPreviewCallId = event.toolCallId;
-		// Modes whose args declare the change itself (replace / patch / freeform
-		// patch) preview without touching the filesystem.
-		const preview = editCallPreview(input);
-		if (preview) setEditDiff(preview.path, preview.diff);
-		try {
-			record("edit", input);
-		} catch {
-			/* skip */
-		}
-		bumpFilesVersion();
+		filesActivity.onToolCall(event, ctx.cwd);
 		if (anyPanelActive()) requestRender();
 	});
 	pi.on("tool_result", (event) => {
-		if (event.toolName !== "edit") return;
-		// Authoritative diff from the result details (branch-correct).
-		const result = editResultDiff(event.details);
-		if (!result) return;
-		// A slower, older result must not overwrite a newer edit's preview.
-		if (event.toolCallId !== editPreviewCallId) return;
-		setEditDiff(result.path || editDiff.path, result.diff);
-		if (anyPanelActive()) requestRender();
+		if (filesActivity.onToolResult(event, currentContext?.cwd ?? process.cwd()) && anyPanelActive())
+			requestRender();
 	});
 
 	// Subagent activity: the native task framework publishes its frames on the
@@ -1464,8 +1059,7 @@ export default function (pi: ExtensionAPI) {
 				entry.subagent = true;
 				entry.agent = subagentAgentBy.get(bag.id) ?? bag.id;
 			}
-			for (const { abs } of pathsFrom(frame.toolName, frame.args)) recordPath(abs, "a");
-			bumpFilesVersion();
+			filesActivity.onSubagentToolCall(frame.toolName, frame.args, currentContext?.cwd ?? process.cwd());
 		} else if (frame.type === "tool_execution_update") {
 			const entry = toolsBy.get(id);
 			if (entry) {
