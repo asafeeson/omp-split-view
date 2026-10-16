@@ -569,6 +569,8 @@ const toolsVersion = () => toolsVersionCounter;
 
 // ─── files buffer ────────────────────────────────────────────────────────────
 
+type FileOp = "r" | "w" | "s" | "a";
+
 interface FileEntry {
 	path: string;
 	ops: string;
@@ -600,10 +602,10 @@ function filePathFromRead(raw: unknown): string {
 	return kind === "none" ? raw : raw.slice(0, i);
 }
 
-function pathsFrom(toolName: string, input: unknown): { abs: string; op: string }[] {
+function pathsFrom(toolName: string, input: unknown): { abs: string; op: FileOp }[] {
 	const bag = fieldBag(input);
-	const out: { abs: string; op: string }[] = [];
-	const add = (v: unknown, op: string, unconditional: boolean) => {
+	const out: { abs: string; op: FileOp }[] = [];
+	const add = (v: unknown, op: FileOp, unconditional: boolean) => {
 		if (typeof v !== "string" || !v || SCHEME_URL.test(v)) return;
 		try {
 			const abs = resolveToCwd(v, currentContext?.cwd ?? process.cwd());
@@ -659,7 +661,7 @@ function pathsFrom(toolName: string, input: unknown): { abs: string; op: string 
 }
 
 /** Record one file with an op: newest-first, MAX_FILES-bounded (oldest evicted). */
-function recordPath(abs: string, op: string): void {
+function recordPath(abs: string, op: FileOp): void {
 	const prev = files.get(abs);
 	if (prev) {
 		files.delete(abs);
