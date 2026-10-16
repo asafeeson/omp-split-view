@@ -1,113 +1,49 @@
 /**
- * split-view.ts — unified panel TUI extension
- *
- * One extension owns the whole "split the main window" surface:
- *   - thinking panel  (top-left band)
- *   - tools panel     (top-right band)
- *   - files panel     (right dock side column, with an edit-diff subpanel)
- *
- * Layout (fullscreen, composed in ONE layer owned by layout-manager):
- *
- *   band on?  files on?
- *   ─────────────────────────────────────
- *   both  → HStack(VStack(band, transcript), filesDock)
- *   band  → VStack(band, transcript)
- *   files → HStack(transcript, filesDock)
- *   none  → transcript (no layer)
- *
- * With trimResponse on, "transcript" above is replaced by the response doc
- * ScrollView + the base root's reused editor dock (works standalone, without
- * band or files).
- *
- * Regular (non-fullscreen) mode: the files panel falls back to a non-capturing
- * overlay; the band needs the layout engine and only works in fullscreen.
- *
- * Commands:
- *   /split              full toggle pair: OFF = all panels off (bare pi
- *                       layout), ON = the panel flags saved as startup defaults
- *   /split-thinking     toggle the thinking panel within the band
- *   /split-tools        toggle the tools panel within the band
- *   /files              toggle the files panel (dock in fullscreen, overlay otherwise)
- *   /split-tools-view   toggle tool panel compact ↔ full detail
- *   /split-trim-response toggle panel C: pi transcript ↔ response-only view
- *   /split-height <n>   set the top band height in rows (6–40)
- *   /split-save       persist current layout as startup defaults for NEW
- *                     windows (toggles are session-local by default, so
- *                     concurrent pi windows don't clobber each other)
- *
- * Panels use the measurement-safe architecture: no separate border-column
- * flanks; the ScrollView's always-on scrollbar (track styled as border) IS the right frame
- * edge, and MeasurementSafeVStack subclasses make the engine's discarded
- * intrinsic-height measurement passes O(1) instead of eagerly rendering whole
- * subtrees (panels + transcript) every keystroke frame. Bodies render a
- * newest-first row-capped window (~96 rows). Full history stays in the
- * transcript; the band is a recent-history view.
- *
- * Panel C trim mode (trimResponse): the transcript region of pi's base root is
- * swapped for an extension-owned ScrollView over a document of user / assistant
- * messages (reused from branch + streamed live via pi's own message
- * components), so rendering matches the native transcript minus tool calls,
- * thinking blocks and extension custom entries. The editor dock
- * (pending/status/editor/footer) is reused verbatim, so input is untouched.
- *
- * Response-only is native-parity BY DESIGN (SV-09/SV-10/SV-18, USER DECISION
- * 2026-10-07, decisions/E-policy.md): it shows TEXT content only — pi's own
- * transcript renders user messages as text and drops non-text blocks, so
- * image-only user turns render nothing there either; it keeps FULL scrollback
- * (unbounded — pi's own transcript is unbounded and offers no virtualization
- * primitive, so this matches the platform's cost model, a constant factor
- * only); and it preserves the NUMERIC scroll offset across branch switches —
- * the ScrollView clamps the old offset into the new content, exactly like
- * the native transcript on the same /tree switch. Toggling trim itself does
- * not move the response doc's scroll position.
- *
- * Single-TUI-context assumption (SV-20): this extension and layout-manager.ts
- * assume ONE interactive TUI context per process. Module state (tuiRef, panel
- * flags, buffers) and the shared layout manager (one tuiRef / baseRoot / layer
- * map on globalThis) are singletons. pi does not guarantee this upstream, and
- * simultaneous TUI contexts in one process are unverified and unsupported.
- *
- * Performance: pi's renderCache is fresh every frame, so panels cache their
- * wrapped/styled output on a (version, width) key; unchanged frames are O(1).
- * requestRender() is gated on any panel being active.
- *
- * Shortcuts (ctrl+o/ctrl+t) are dropped: reserved built-ins, un-registrable.
+ * Split-view for OMP. A native fullscreen overlay owns panel geometry while
+ * retaining the live host transcript, editor, status and dialog components.
+ * Closing the view returns to OMP's untouched normal-screen history provider.
+ * Recent thinking/tool buffers are bounded; response-only history is text-only.
  */
 
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import { renderDiff } from "@oh-my-pi/pi-tui/chrome";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import { UserMessageComponent } from "@oh-my-pi/pi-tui/chat/user-message";
+import { textContent } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import { getEditInputPaths } from "@oh-my-pi/pi-tui/tools/edit";
+import { parseSel } from "@oh-my-pi/pi-coding-agent/tools/read-selector";
+import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
+import { editDiffString } from "@oh-my-pi/pi-natives";
 import {
-	generateDiffString,
-	renderDiff,
-	AssistantMessageComponent,
-	UserMessageComponent,
-	getMarkdownTheme,
-	type ExtensionAPI,
-	type ExtensionContext,
-	type Theme,
-} from "@earendil-works/pi-coding-agent";
+	TASK_SUBAGENT_EVENT_CHANNEL,
+	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+	TASK_SUBAGENT_PROGRESS_CHANNEL,
+} from "@oh-my-pi/pi-coding-agent/task";
 import {
 	Container,
-	HStack,
 	ScrollView,
 	Spacer,
-	VStack,
-	type Component,
-	type OverlayHandle,
 	wrapTextWithAnsi,
 	truncateToWidth,
 	visibleWidth,
-} from "@earendil-works/pi-tui";
+	matchesKey,
+} from "@oh-my-pi/pi-tui";
+import type { TUI } from "@oh-my-pi/pi-tui";
 import {
 	loadUiPanelsConfig,
 	saveUiPanelsConfig,
 	normalizeConfig,
 	type ToolMode as ToolModeCfg,
 } from "./ui-panels-config.ts";
+import { SUBAGENT_SNAPSHOT_TYPE, SubagentsPanel } from "./subagents-panel.ts";
+import { fieldBag, themeFingerprint } from "./panel-utils.ts";
 import {
-	getBaseRoot,
+	getNativeRegions,
 	initLayoutManager,
 	setLayoutLayer,
 	isLayoutLayerActive,
-	selfHealLayout,
+	resetLayoutManager,
 } from "./layout-manager.ts";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -138,38 +74,24 @@ const LEGEND = "r read · w write · s seen(bash) · a subagent";
 
 // ─── module-lifetime state ───────────────────────────────────────────────────
 
-let tuiRef: any;
+let tuiRef: TUI | undefined;
 let widgetSet = false;
-let startupTimer: ReturnType<typeof setTimeout> | null = null;
-/** SV-14: the saved startup composition is still unapplied. Armed in
- * session_start before reconstruct(); consumed by the widget factory (the
- * first point where the fullscreen root is available, BEFORE the first
- * paint) or by the deferred startup timer as a fallback. */
-let startupPending = false;
-
-// Overlay registry for the regular-mode files panel (survives /reload).
-const REG_KEY = Symbol.for("pi.explored-files");
-interface Registry {
-	gen: number;
-	active?: OverlayHandle | null;
-	activeGen?: number;
-	/** The overlay's component, stored so the extension — the valid lifecycle
-	 * owner — can dispose it on close/shutdown (Option C: no ctx.ui.custom()
-	 * promise exists to dispose it for us). decisions/D-overlay-lifecycle.md */
-	panel?: FilesPanel | null;
-}
-const G = globalThis as Record<symbol, Registry>;
-const REG: Registry = G[REG_KEY] ?? { gen: 0 };
-G[REG_KEY] = REG;
-const MY_GEN = ++REG.gen;
-
-/** Terminal height, captured by the overlay's visible callback each render. */
 let termHeight = 0;
+let panelNotice: { text: string; type: "info" | "warning" | "error" } | undefined;
+
+/** Keep command feedback visible when the native notification transcript is hidden. */
+function notify(ctx: ExtensionContext, text: string, type: "info" | "warning" | "error"): void {
+	currentContext = ctx;
+	ctx.ui.notify(text, type);
+	panelNotice = trimResponse && ctx.mode === "tui" ? { text, type } : undefined;
+	requestRender();
+}
 
 // Panel enable flags (kept in sync with config; thinking/tools default true).
 let thinkingOn = true;
 let toolsOn = true;
 let filesOn = false;
+let subagentsOn = false;
 let toolMode: ToolModeCfg = "compact";
 /** Panel C: response-only view instead of pi's transcript (persisted). */
 let trimResponse = false;
@@ -179,27 +101,10 @@ let bandHeight = 14;
  * persisted as toolsWidthPct; session-local, only /split-save writes it). */
 let toolsWidthPct = 35;
 
-/** SV-08: fingerprint of the live theme's panel-relevant colors, captured
- * when the composition was built. pi replaces the global theme object on a
- * theme change (extensions receive no event), and components/caches capture
- * ANSI at build time — so the widget render compares this fingerprint and
- * recomposes theme-dependent components on a change ONLY. */
-let composedThemeFp: string | null = null;
-
-function themeFingerprint(theme: Theme): string {
-	return [
-		theme.fg("border", "x"),
-		theme.fg("accent", "x"),
-		theme.fg("muted", "x"),
-		theme.fg("thinkingText", "x"),
-		theme.fg("toolOutput", "x"),
-		theme.fg("success", "x"),
-		theme.fg("error", "x"),
-		theme.fg("warning", "x"),
-		theme.fg("dim", "x"),
-		theme.fg("text", "x"),
-	].join("|");
-}
+const SPLIT_THEME_COLORS = [
+	"border", "accent", "muted", "thinkingText", "toolOutput",
+	"success", "error", "warning", "dim", "text",
+] as const;
 
 // ─── thinking buffer ─────────────────────────────────────────────────────────
 
@@ -378,135 +283,107 @@ function thinkingLines(theme: Theme, width: number): string[] {
 // ─── response doc (panel C trim mode) ───────────────────────────────
 
 /**
- * Panel C's document: user + assistant messages only, rendered with pi's own
- * transcript components. Built from the branch (session start / tree) and
- * streamed live (message_start/update/end). Assistant content is filtered to
- * drop thinking blocks (panel A owns those) — tool calls never render here
- * (panel B owns those), so an assistant message with no text is skipped.
+ * Panel C's document: user + assistant messages only, rendered with the
+ * transcript's own components (native contracts, native themes). Built from
+ * the branch (session start / tree) and streamed live (message_start/update/end).
+ *
+ * Assistant messages are handed over verbatim: the native
+ * AssistantMessageComponent renders text blocks in order, renders NOTHING for
+ * `toolCall` blocks (tool components own those — panel B), and hides thinking
+ * blocks through its own `hideThinkingBlock` flag (panel A owns those). So no
+ * content filtering is needed; only an assistant turn with no text at all is
+ * skipped, so tool-only / thinking-only rounds add no stray spacer.
  */
 const responseDoc = new Container();
 let streamingResponseComponent: AssistantMessageComponent | null = null;
 
-function messageText(msg: any): string {
-	const c = msg?.content;
-	if (typeof c === "string") return c;
-	if (Array.isArray(c))
-		return c
-			.filter((p: any) => p?.type === "text" && typeof p.text === "string")
-			.map((p: any) => p.text)
-			.join("");
-	return "";
+/** Native assistant-message shape, derived from the component's own signature. */
+type ResponseAssistantMessage = NonNullable<ConstructorParameters<typeof AssistantMessageComponent>[0]>;
+/** Native user-message fields the response doc consumes. */
+interface ResponseUserMessage {
+	content: Parameters<typeof textContent>[0];
+	liveSteered?: boolean;
+	timestamp?: number;
 }
 
-/** Content with thinking blocks and tool calls stripped (panel C is response-only). */
-function responseContent(msg: any): any[] {
-	return (Array.isArray(msg?.content) ? msg.content : []).filter(
-		(c: any) => c?.type !== "thinking" && c?.type !== "toolCall",
+/**
+ * The response doc's assistant component: native, thinking hidden (panel A owns
+ * it) and images off (panel C is text-only, so nothing but text rows render).
+ */
+function createResponseAssistantComponent(
+	msg?: ResponseAssistantMessage,
+): AssistantMessageComponent {
+	// Disable images before the first content pass to avoid conversion work.
+	const component = new AssistantMessageComponent(undefined, true, requestRender);
+	component.setImagesVisible(false);
+	component.setToolResultImagesVisible(false);
+	if (msg) component.updateContent(msg);
+	return component;
+}
+
+/** Append a user message (text only — an image-only turn renders nothing). */
+function addResponseUser(msg: ResponseUserMessage): void {
+	const text = textContent(msg.content);
+	if (!text.trim()) return;
+	if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
+	responseDoc.addChild(
+		new UserMessageComponent(text, {
+			liveSteered: msg.liveSteered === true,
+			timestamp: msg.timestamp,
+		}),
 	);
 }
 
-/** Append a message to the response doc (user or assistant). */
-function addResponseMessage(msg: any): void {
-	try {
-		if (msg.role === "user") {
-			const text = messageText(msg);
-			if (!text.trim()) return;
-			if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
-			responseDoc.addChild(new UserMessageComponent(text, getMarkdownTheme()));
-			return;
-		}
-		if (msg.role === "assistant") {
-			const content = responseContent(msg);
-			const hasText = content.some(
-				(c: any) =>
-					c?.type === "text" && typeof c.text === "string" && c.text.trim(),
-			);
-			// Keep empty-text messages whose stopReason shows an error marker.
-			if (!hasText && msg.stopReason !== "error" && msg.stopReason !== "aborted")
-				return;
-			if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
-			// toolCalls are stripped too so the component's error/abort markers
-			// render (it suppresses them when toolCalls exist — in the full
-			// transcript the tool components show errors instead).
-			responseDoc.addChild(
-				new AssistantMessageComponent(
-					{ ...msg, content },
-					true,
-					getMarkdownTheme(),
-					"Thinking…",
-					1,
-					[],
-				),
-			);
-		}
-	} catch {
-		/* theme not ready yet — skipped; rebuilt on next reconstruct */
-	}
+/** Append an assistant message (text only: thinking, tools and images excluded). */
+function addResponseAssistant(msg: ResponseAssistantMessage): void {
+	const hasText = msg.content.some(c => c.type === "text" && c.text.trim().length > 0);
+	// Keep error/abort turns: the component renders their stopReason marker.
+	if (!hasText && msg.stopReason !== "error" && msg.stopReason !== "aborted") return;
+	if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
+	responseDoc.addChild(createResponseAssistantComponent(msg));
 }
 
 /** Rebuild the whole response doc from the current branch. */
 function rebuildResponseDoc(ctx: ExtensionContext): void {
+	// A branch change preserves numeric position, even when the old doc was at tail.
+	if (responseDocInitialized && responseScrollView) {
+		responseScrollView.setFollowTail(false);
+		preserveResponsePosition = true;
+	}
 	responseDoc.clear();
 	streamingResponseComponent = null;
-	const branch = ctx.sessionManager.getBranch();
-	for (const entry of branch) {
+	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.type !== "message") continue;
-		const msg = (entry as any).message;
-		if (msg) addResponseMessage(msg);
+		const msg = entry.message;
+		if (msg.role === "user") addResponseUser(msg);
+		else if (msg.role === "assistant") addResponseAssistant(msg);
 	}
+	responseDocInitialized = true;
 }
 
 /** Live-stream an assistant message into the doc (lazy: created on first visible text). */
-function responseMessageUpdate(msg: any): void {
-	if (msg?.role !== "assistant") return;
-	const stripped = { ...msg, content: responseContent(msg) };
-	const hasVisible = stripped.content.some(
-		(c: any) => c?.type === "text" && typeof c.text === "string" && c.text.trim(),
-	);
+function responseMessageUpdate(msg: ResponseAssistantMessage): void {
 	if (!streamingResponseComponent) {
 		// Pure tool-call / thinking rounds never create a component — no stray
 		// spacers accumulate in the doc.
-		if (!hasVisible) return;
-		try {
-			if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
-			streamingResponseComponent = new AssistantMessageComponent(
-				undefined as any,
-				true,
-				getMarkdownTheme(),
-				"Thinking…",
-				1,
-				[],
-			);
-			responseDoc.addChild(streamingResponseComponent);
-		} catch {
-			/* theme not ready */
-			return;
-		}
+		if (!msg.content.some(c => c.type === "text" && c.text.trim().length > 0)) return;
+		if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
+		const component = createResponseAssistantComponent();
+		streamingResponseComponent = component;
+		responseDoc.addChild(component);
 	}
-	try {
-		streamingResponseComponent.updateContent(stripped, true);
-	} catch {
-		/* ignore */
-	}
+	streamingResponseComponent.updateContent(msg, { transient: true });
 }
 
-function responseMessageEnd(msg: any): void {
-	if (msg?.role !== "assistant") return;
+function responseMessageEnd(msg: ResponseAssistantMessage): void {
 	if (streamingResponseComponent) {
-		try {
-			streamingResponseComponent.updateContent(
-				{ ...msg, content: responseContent(msg) },
-				false,
-			);
-		} catch {
-			/* ignore */
-		}
+		streamingResponseComponent.updateContent(msg);
 		streamingResponseComponent = null;
 	} else {
 		// No component was streamed (no update fired, or thinking/tool-only
-		// round): finalize from the full message — addResponseMessage itself
-		// skips empty text and keeps error/abort markers.
-		addResponseMessage(msg);
+		// round): finalize from the full message — addResponseAssistant skips
+		// text-less rounds and keeps error/abort markers.
+		addResponseAssistant(msg);
 	}
 }
 
@@ -570,24 +447,27 @@ function capToolText(s: string): string {
 	return marker + s.slice(end);
 }
 
-function resultText(r: any): string {
-	let text: string;
-	if (typeof r === "string") text = r;
-	else {
-		const content = r?.content;
-		if (typeof content === "string") text = content;
-		else if (Array.isArray(content)) {
-			text = content
-				.filter((c: any) => c?.type === "text" && typeof c.text === "string")
-				.map((c: any) => c.text)
-				.join("");
-		} else text = "";
+/** SV-16: text of a tool result payload — a plain string, or the text blocks of
+ * a native `AgentToolResult` / `ToolResultMessage` content array. */
+function resultText(result: unknown): string {
+	const payload =
+		typeof result === "object" && result !== null && "content" in result
+			? result.content
+			: result;
+	if (typeof payload === "string") return capToolText(payload);
+	if (!Array.isArray(payload)) return "";
+	const blocks: unknown[] = payload;
+	let text = "";
+	for (const block of blocks) {
+		if (!block || typeof block !== "object") continue;
+		if (!("type" in block) || block.type !== "text") continue;
+		if ("text" in block && typeof block.text === "string") text += block.text;
 	}
 	// SV-16: bound the stored text before the caller splits/keeps lines.
 	return capToolText(text);
 }
 
-function argsJson(args: any): string {
+function argsJson(args: unknown): string {
 	try {
 		// SV-16: bound the stored args JSON (newest suffix + marker).
 		return capToolText(JSON.stringify(args ?? {}));
@@ -606,7 +486,7 @@ function setToolOutput(e: ToolEntry, text: string): void {
  * branch reconstruction (resume / session_tree), so the bounded buffer,
  * the newest-first display and the MAX_TOOLS eviction (oldest shifted out)
  * behave identically for resumed and live entries. */
-function ingestToolCall(id: string, name: string, args: any): void {
+function ingestToolCall(id: string, name: string, args: unknown): void {
 	toolOrder.push(id);
 	toolsBy.set(id, {
 		id,
@@ -626,7 +506,7 @@ function ingestToolCall(id: string, name: string, args: any): void {
 /** SV-17: ingest one tool result, correlated to its call by id (live event
  * or resumed branch entry). A result whose call is not in the bounded buffer
  * (evicted or unknown) is ignored. */
-function ingestToolResult(id: string, result: any, isError: boolean): void {
+function ingestToolResult(id: string, result: unknown, isError: boolean): void {
 	const e = toolsBy.get(id);
 	if (!e) return;
 	const text = resultText(result);
@@ -689,6 +569,8 @@ const toolsVersion = () => toolsVersionCounter;
 
 // ─── files buffer ────────────────────────────────────────────────────────────
 
+type FileOp = "r" | "w" | "s" | "a";
+
 interface FileEntry {
 	path: string;
 	ops: string;
@@ -697,18 +579,49 @@ interface FileEntry {
 const files = new Map<string, FileEntry>();
 let filesVersion = 0;
 
-function pathsFrom(
-	toolName: string,
-	input: any,
-): { abs: string; op: string }[] {
-	const out: { abs: string; op: string }[] = [];
+/** Non-file target prefix (URL, `artifact://`, `skill://`, MCP resource). */
+const SCHEME_URL = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+
+/**
+ * Native `read` embeds its selector inline in `path` (`notes.txt:450-455`,
+ * `notes.txt:-5`, `notes.txt:raw`); the files panel tracks the underlying file.
+ * A trailing chunk is peeled off only when the native selector parser accepts
+ * it as a selector (an unrecognized chunk is part of the path/filename).
+ */
+function filePathFromRead(raw: unknown): string {
+	if (typeof raw !== "string" || !raw) return "";
+	const i = raw.lastIndexOf(":");
+	if (i <= 0 || i === raw.length - 1) return raw;
+	let kind: string;
+	try {
+		kind = parseSel(raw.slice(i + 1)).kind;
+	} catch {
+		return raw;
+	}
+	return kind === "none" ? raw : raw.slice(0, i);
+}
+
+function pathsFrom(toolName: string, input: unknown): { abs: string; op: FileOp }[] {
+	const bag = fieldBag(input);
+	const out: { abs: string; op: FileOp }[] = [];
+	const add = (v: unknown, op: FileOp, unconditional: boolean) => {
+		if (typeof v !== "string" || !v || SCHEME_URL.test(v)) return;
+		try {
+			const abs = resolveToCwd(v, currentContext?.cwd ?? process.cwd());
+			if (!unconditional && (!existsSync(abs) || !statSync(abs).isFile())) return;
+			out.push({ abs, op });
+		} catch {
+			/* skip */
+		}
+	};
 	if (toolName === "bash") {
-		const cmd = typeof input?.command === "string" ? input.command : "";
+		const cmd = typeof bag.command === "string" ? bag.command : "";
 		for (const raw of cmd.split(/\s+/)) {
 			const tok = raw.replace(/^[("'`]+/, "").replace(/[)"'`;:,]+$/, "");
 			if (!tok || tok.startsWith("-") || /[|&><`$*?]/.test(tok)) continue;
 			try {
-				const abs = path.resolve(tok);
+				const abs = resolveToCwd(tok, currentContext?.cwd ?? process.cwd());
 				if (existsSync(abs) && statSync(abs).isFile()) out.push({ abs, op: "s" });
 			} catch {
 				/* skip */
@@ -716,49 +629,60 @@ function pathsFrom(
 		}
 		return out;
 	}
-	const add = (v: unknown, op: string, unconditional: boolean) => {
-		if (typeof v !== "string" || !v) return;
-		try {
-			const abs = path.resolve(v);
-			if (!unconditional && (!existsSync(abs) || !statSync(abs).isFile())) return;
-			out.push({ abs, op });
-		} catch {
-			/* skip */
-		}
-	};
 	if (toolName === "read") {
-		add(input?.path, "r", true);
+		add(filePathFromRead(bag.path), "r", true);
 		return out;
 	}
-	if (toolName === "write" || toolName === "edit") {
-		add(input?.path, "w", true);
+	if (toolName === "write") {
+		add(bag.path, "w", true);
 		return out;
 	}
-	for (const key of ["path", "filePath", "file_path", "imagePath"])
-		add(input?.[key], "r", false);
+	if (toolName === "edit") {
+		// The native edit tool has ONE schema per session mode: replace/patch carry
+		// `path` (patch entries may also `rename` a target), while
+		// hashline/apply_patch/sloppy carry a freeform patch in `input` whose
+		// target paths come from the native parser.
+		add(bag.path, "w", true);
+		if (typeof bag.input === "string" && bag.input)
+			for (const target of getEditInputPaths(bag.input)) add(target, "w", true);
+		const edits: unknown[] = Array.isArray(bag.edits) ? bag.edits : [];
+		for (const entry of edits) {
+			if (!entry || typeof entry !== "object") continue;
+			if ("rename" in entry && typeof entry.rename === "string") add(entry.rename, "w", true);
+		}
+		return out;
+	}
+	for (const key of ["path", "filePath", "file_path", "imagePath"]) add(bag[key], "r", false);
 	for (const key of ["paths", "files", "filePaths"]) {
-		if (Array.isArray(input?.[key]))
-			for (const v of input[key]) add(v, "r", false);
+		const list = bag[key];
+		if (Array.isArray(list)) for (const v of list) add(v, "r", false);
 	}
 	return out;
 }
 
-function record(toolName: string, input: any): void {
+/** Record one file with an op: newest-first, MAX_FILES-bounded (oldest evicted). */
+function recordPath(abs: string, op: FileOp): void {
+	const prev = files.get(abs);
+	if (prev) {
+		files.delete(abs);
+		prev.count++;
+		if (!prev.ops.includes(op)) prev.ops += op;
+		files.set(abs, prev);
+		return;
+	}
+	if (files.size >= MAX_FILES) {
+		const oldest = files.keys().next();
+		if (!oldest.done) files.delete(oldest.value);
+	}
+	files.set(abs, { path: abs, ops: op, count: 1 });
+}
+
+function record(toolName: string, input: unknown): void {
 	const seen = new Set<string>();
 	for (const { abs, op } of pathsFrom(toolName, input)) {
 		if (seen.has(abs)) continue;
 		seen.add(abs);
-		const prev = files.get(abs);
-		if (prev) {
-			files.delete(abs);
-			prev.count++;
-			if (!prev.ops.includes(op)) prev.ops += op;
-			files.set(abs, prev);
-		} else {
-			if (files.size >= MAX_FILES)
-				files.delete(files.keys().next().value as string);
-			files.set(abs, { path: abs, ops: op, count: 1 });
-		}
+		recordPath(abs, op);
 	}
 	filesVersion++;
 }
@@ -770,7 +694,8 @@ function bumpFilesVersion(): void {
 const recentEntries = (): FileEntry[] => [...files.values()].reverse();
 
 function displayPath(abs: string): string {
-	const rel = path.relative(process.cwd(), abs);
+	if (SCHEME_URL.test(abs)) return abs;
+	const rel = path.relative(currentContext?.cwd ?? process.cwd(), abs);
 	if (rel && !rel.startsWith("..")) return rel;
 	const home = homedir();
 	if (abs.startsWith(home + path.sep)) return `~${abs.slice(home.length)}`;
@@ -792,36 +717,66 @@ function widgetLines(theme: Theme, width: number): string[] {
 
 // ─── edit-diff buffer ────────────────────────────────────────────────────────
 
-/**
- * Raw (unrendered) diff state for the files panel's bottom subpanel.
- * We store raw text (not ANSI) so it survives theme changes; `renderDiff` is
- * applied at draw time. A monotonic token guards against out-of-order async
- * diff computations overwriting a newer edit with a stale older one.
- */
+/** Raw diff stays theme-independent; only the latest edit call owns its preview. */
 const editDiff = {
 	path: "" as string,
 	diff: "" as string,
 	version: 0,
-	token: 0,
 };
-let pendingDiffToken = 0;
-/** SV-23: edit preview/result correlation. Every edit tool_call gets a
- * monotonically increasing generation and owns the preview; a tool_result
- * applies its authoritative diff only when its toolCallId maps to the current
- * generation, so an older, slower edit can never overwrite a newer preview. */
-let editGeneration = 0;
-const editGenByCallId = new Map<string, number>();
+let editPreviewCallId: string | undefined;
 
 function setEditDiff(p: string, diff: string): void {
-	editDiff.path = p;
+	editDiff.path = p && !SCHEME_URL.test(p)
+		? resolveToCwd(p, currentContext?.cwd ?? process.cwd()) : p;
 	editDiff.diff = diff;
 	editDiff.version++;
 }
 
 function clearEditDiff(): void {
+	editPreviewCallId = undefined;
 	editDiff.path = "";
 	editDiff.diff = "";
 	editDiff.version++;
+}
+
+/**
+ * Diff + display path a not-yet-executed native `edit` call declares in its
+ * args. The tool has ONE schema per session mode: `path` + `old_string`/
+ * `new_string` (replace), `path` + `edits[].diff` (patch), or a freeform patch
+ * in `input` (hashline / apply_patch / sloppy), whose target paths the native
+ * parser names. Modes that carry a patch verbatim are shown verbatim — the
+ * preview never reads a file, and the result replaces it authoritatively.
+ */
+function editCallPreview(input: unknown): { path: string; diff: string } | null {
+	const bag = fieldBag(input);
+	const path = typeof bag.path === "string" ? bag.path : "";
+	let diff = "";
+	if (typeof bag.input === "string" && bag.input.trim()) {
+		diff = bag.input;
+	} else if (typeof bag.old_string === "string" || typeof bag.new_string === "string") {
+		const oldText = typeof bag.old_string === "string" ? bag.old_string : "";
+		const newText = typeof bag.new_string === "string" ? bag.new_string : "";
+		if (oldText !== newText) diff = editDiffString(oldText, newText, path || null).diff;
+	} else {
+		const edits: unknown[] = Array.isArray(bag.edits) ? bag.edits : [];
+		const parts: string[] = [];
+		for (const entry of edits) {
+			if (!entry || typeof entry !== "object") continue;
+			if ("diff" in entry && typeof entry.diff === "string" && entry.diff) parts.push(entry.diff);
+		}
+		diff = parts.join("\n");
+	}
+	if (!diff) return null;
+	const targets = typeof bag.input === "string" ? getEditInputPaths(bag.input) : [];
+	return { path: path || targets[0] || "", diff };
+}
+
+/** Diff + display path of a native `edit` result (`details` is untyped). */
+function editResultDiff(details: unknown): { path: string; diff: string } | null {
+	if (!details || typeof details !== "object") return null;
+	if (!("diff" in details) || typeof details.diff !== "string" || !details.diff) return null;
+	const path = "path" in details && typeof details.path === "string" ? details.path : "";
+	return { path, diff: details.diff };
 }
 
 // ─── shared helpers ──────────────────────────────────────────────────────────
@@ -834,17 +789,8 @@ function requestRender(): void {
 	}
 }
 
-const anyPanelActive = () =>
-	isLayoutLayerActive("ui") || isLayoutLayerActive("files") || !!REG.active;
-// SV-01 (revised): /split is a full toggle pair over every panel flag
-// (thinking/tools/files/trim), so its "on" state is the flag disjunction.
-// The old bandActive() derived state from the band alone, which made a
-// files-only or trim-only layout report "off" for a not-bare view and left
-// those panels running after a /split off. Layout-layer checks remain in use
-// only for layout ownership (anyPanelActive/filesActive).
-const panelsActive = () =>
-	thinkingOn || toolsOn || filesOn || trimResponse;
-const filesActive = () => isLayoutLayerActive("files") || !!REG.active;
+const anyPanelActive = () => isLayoutLayerActive();
+const panelsActive = () => thinkingOn || toolsOn || filesOn || subagentsOn || trimResponse;
 
 // ─── framed panel components ─────────────────────────────────────────────────
 
@@ -884,19 +830,6 @@ class BorderBottom {
 	dispose(): void {}
 }
 
-/**
- * OracleSpec: a VStack whose component-level render() is a constant sentinel.
- * The layout engine checks LAYOUT_NODE before plain render (layoutComponent),
- * so real layout/painting is untouched — but the engine's DISCARDED intrinsic-
- * height measurement passes (hstack node branch) call component.render() and
- * now cost O(1) instead of eagerly rendering the whole subtree (band panels,
- * and via the dock, the full transcript) on every keystroke frame.
- */
-class MeasurementSafeVStack extends VStack {
-	render(_width: number): string[] {
-		return [""];
-	}
-}
 
 /**
  * OracleSpec body: renders the recent window with a left │ edge only — the
@@ -908,6 +841,7 @@ class MeasurementSafeVStack extends VStack {
  */
 class RecentBody {
 	private cacheVersion = -1;
+	private cacheMinRows = -1;
 	/** SV-19: bounded width cache — keep the current width plus a small LRU of
 	 * recent widths so resize cycling cannot grow it unbounded. */
 	private cacheByWidth = new Map<number, string[]>();
@@ -924,8 +858,10 @@ class RecentBody {
 	render(width: number): string[] {
 		const th = this.theme;
 		const v = this.version();
-		if (v !== this.cacheVersion) {
+		const min = Math.max(1, this.minRows());
+		if (v !== this.cacheVersion || min !== this.cacheMinRows) {
 			this.cacheVersion = v;
+			this.cacheMinRows = min;
 			this.cacheByWidth.clear();
 		}
 		const cached = this.cacheByWidth.get(width);
@@ -979,7 +915,6 @@ class RecentBody {
 			out = rows.map((r) => edge + r + pad(r));
 		}
 		// Guarantee a continuous left edge: fill short content up to minRows.
-		const min = Math.max(1, this.minRows());
 		const filler = edge + " ".repeat(Math.max(0, width - 1));
 		while (out.length < min) out.push(filler);
 		this.cacheByWidth.set(width, out);
@@ -1007,18 +942,13 @@ class FilesPanel {
 
 	constructor(
 		private theme: Theme,
-		/** Fullscreen dock: live terminal rows. Overlay: undefined. */
+		/** Current allocated screen height. */
 		private heightProvider?: () => number,
 	) {}
 
-	// No handleInput: the regular-mode overlay is nonCapturing, so it never
-	// receives keys — Escape belongs to the editor/Pi, and /files is the
-	// close/reopen path (Option C, decisions/D-overlay-lifecycle.md).
 
-	render(width: number): string[] {
-		if (REG.gen !== MY_GEN) return [];
-		const height =
-			this.heightProvider?.() || termHeight || recentEntries().length + 12;
+	render(width: number, allocatedHeight?: number): string[] {
+		const height = allocatedHeight ?? (this.heightProvider?.() || termHeight || recentEntries().length + 12);
 		// Cache key MUST include height: a height-only terminal resize changes
 		// the list/diff row split without bumping filesVersion or width.
 		const key = `${filesVersion}|${editDiff.version}|${width}|${height}`;
@@ -1097,7 +1027,7 @@ class FilesPanel {
 		// title can never overrun the fill and collide with the right border.
 		// Budget: leading " ✎ " + trailing " " around the path text.
 		const title = editDiff.path
-			? th.fg("accent", ` ✎ ${truncateToWidth(displayPath(editDiff.path), inner - 4, "…")} `)
+			? th.fg("accent", ` ✎ ${truncateToWidth(displayPath(editDiff.path), inner - 4)} `)
 			: th.fg("dim", " Last Edit ");
 		const titleFill = "─".repeat(
 			Math.max(0, inner - visibleWidth(title)),
@@ -1110,7 +1040,11 @@ class FilesPanel {
 		);
 
 		if (editDiff.diff) {
-			const rendered = renderDiff(editDiff.diff).split(/\r?\n/);
+			// Native diff renderer: parses the tool's compact numbered diff text
+			// (`+12|…`) and highlights context lines by the target file's language.
+			const rendered = renderDiff(editDiff.diff, {
+				filePath: editDiff.path || undefined,
+			}).split(/\r?\n/);
 			// SV-06: cap content one row below the pad target so the "… +N more"
 			// marker always fits; the section is then padded to diffRows so the
 			// frame closes on the last row.
@@ -1136,8 +1070,8 @@ class FilesPanel {
 			th.fg("border", `╰${"─".repeat(inner)}╯`),
 		];
 		this.cacheKey = key;
-		this.cacheLines = out;
-		return out;
+		this.cacheLines = out.slice(0, height);
+		return this.cacheLines;
 	}
 
 	invalidate(): void {
@@ -1146,289 +1080,141 @@ class FilesPanel {
 	dispose(): void {}
 }
 
-// ─── layout composition (one layer) ──────────────────────────────────────────
+// ─── native OMP frame composition ─────────────────────────────────────────────
 
-/**
- * Panel scaffold: no separate border columns, no inner HStack — the always-on
- * scrollbar column is the right frame edge (track styled as border; the idle
- * full-height thumb is border-colored too, accent only while actively
- * scrolling), so nothing ever paints over a frame line and there is no
- * second composite layer. The MeasurementSafeVStack wrapper keeps the
- * engine's discarded measurement passes O(1).
- */
-function framedPanel(
-	theme: Theme,
-	top: Component,
-	body: RecentBody,
-): Component {
-	const scroll = new ScrollView(body, {
-		follow: "end",
-		overscroll: "contain",
-		scrollbar: "always",
-		scrollbarTrackStyle: (t: string) => theme.fg("border", t),
-		// SV-25: the layout engine paints the idle thumb as "┃" (heavy) while
-		// the track is "│" (light) — same border color, different glyph, so the
-		// right frame edge read as broken at the thumb's rows. Map the IDLE
-		// thumb to the track's glyph so the edge is a uniform │ column at rest;
-		// the ACTIVE thumb keeps "█" in accent for scroll feedback. No second
-		// edge column, no track/color change, design unchanged.
-		scrollbarThumbStyle: (t: string) =>
-			theme.fg(t === "█" ? "accent" : "border", t === "┃" ? "│" : t),
-	});
-	return new MeasurementSafeVStack([
-		{ component: top, basis: 1, grow: 0, shrink: 0 },
-		{ component: scroll, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-		{ component: new BorderBottom(theme), basis: 1, grow: 0, shrink: 0 },
-	]);
-}
-
-function buildBand(theme: Theme, inner: Component): Component {
-	const panels: { component: Component; basis: number; grow: number }[] = [];
-	const minRows = () => Math.max(1, bandHeight - 2);
-
-	const defs: {
-		title: string;
-		color: "accent" | "muted";
-		streaming: () => boolean;
-		style: (line: string) => string;
-		lines: (width: number) => string[];
-		version: () => number;
-		empty: string;
-	}[] = [];
-	if (thinkingOn)
-		defs.push({
-			title: "Thinking",
-			color: "accent",
-			streaming: () => thinking.streaming,
-			style: (l) => theme.fg("thinkingText", l),
-			lines: (w) => thinkingLines(theme, w),
-			version: () => thinking.version,
-			empty: "Thinking idle",
-		});
-	if (toolsOn)
-		defs.push({
-			title: "Tool Usage",
-			color: "muted",
-			streaming: () => toolOrder.some((id) => toolsBy.get(id)?.active),
-			style: (l) => l,
-			lines: (w) => toolLines(theme, w),
-			version: toolsVersion,
-			empty: "No tools called yet",
-		});
-
-	// F/F2: explicit tunable width split — no equal-flex weights or engine
-	// content measurement. toolsWidthPct % of the ALLOCATED band width goes
-	// to the tools panel, thinking gets the rest (minimum clamps inside the
-	// helper). F2: the base is the allocated band region — with the files dock
-	// visible (filesOn, ≥ MIN_TERM_WIDTH) that is the terminal width minus the
-	// dock columns (the SV-07 clamp), not the full terminal width.
-	// Single-panel bands keep the full width (no ratio involved).
-	const termCols = tuiRef?.terminal?.columns ?? 120;
-	const dockVisible = filesOn && termCols >= MIN_TERM_WIDTH;
-	const base = termCols - (dockVisible ? dockColsFor(termCols) : 0);
-	const splitBand = defs.length === 2;
-	const toolsW = splitBand ? bandToolsColsFor(base) : -1;
-	const thinkW = base - toolsW;
-	composedBandTermCols = termCols;
-
-	let di = 0;
-	for (const d of defs) {
-		const top = new BorderTop(theme, d.title, d.color, d.streaming);
-		// defs order: thinking first (when on), then tools.
-		const w = splitBand ? (di === 0 ? thinkW : toolsW) : 1;
-		panels.push({
-			component: framedPanel(
-				theme,
-				top,
-				new RecentBody(theme, d.style, d.lines, d.version, d.empty, minRows),
-			),
-			basis: w,
-			grow: splitBand ? 0 : 1,
-		});
-		di++;
-	}
-
-	// No enabled sub-panels → no band at all.
-	if (panels.length === 0) return inner;
-
-	// A single panel needs no HStack wrapper at all.
-	const band =
-		panels.length === 1
-			? panels[0]!.component
-			: new HStack(panels.map((p) => ({ ...p, shrink: 1, minSize: 1 })));
-	const sep = new (class implements Component {
-		invalidate(): void {}
-		dispose(): void {}
-		render(w: number): string[] {
-			return [
-				theme.fg("border", "╭") +
-					theme.fg("border", "─".repeat(Math.max(0, w - 2))) +
-					theme.fg("border", "╮"),
-			];
-		}
-	})();
-	return new VStack([
-		{
-			component: band,
-			basis: bandHeight,
-			grow: 0,
-			shrink: 1,
-			minSize: Math.min(6, bandHeight),
-		},
-		{ component: sep, basis: 1, grow: 0, shrink: 0 },
-		{ component: inner, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-	]);
-}
-
-/** Dock width (clamped, 34–48) that the current composition was built with.
- *  SV-07: the dock basis is captured at compose time; the widget render
- *  compares it against the live terminal width and recomposes on change. */
-let composedDockCols = -1;
-
-/** F: explicit band split — minimum panel widths (cols) below which the
- * toolsWidthPct ratio clamps, so neither panel degenerates at narrow
- * terminals. */
-const MIN_THINK_COLS = 24;
-const MIN_TOOLS_COLS = 20;
-
-/** F: tools panel width (cols) for the given terminal width under the
- * current toolsWidthPct, with the minimum clamps. When both minimums
- * cannot hold (very narrow terminals) the raw ratio is used — the panels
- * share whatever is available. */
-function bandToolsColsFor(total: number): number {
-	const raw = Math.round((total * toolsWidthPct) / 100);
-	let toolsW = raw;
-	let thinkW = total - toolsW;
-	if (toolsW < MIN_TOOLS_COLS) {
-		toolsW = MIN_TOOLS_COLS;
-		thinkW = total - toolsW;
-	}
-	if (thinkW < MIN_THINK_COLS) {
-		thinkW = MIN_THINK_COLS;
-		toolsW = total - thinkW;
-	}
-	if (toolsW < MIN_TOOLS_COLS) {
-		toolsW = raw;
-		thinkW = total - toolsW;
-	}
-	return toolsW;
-}
-
-/** TERMINAL width the current band composition was built with. F2: the
- * widget render recomposes on any terminal-width change, so a resize never
- * leaves a stale basis — even when the tools cols round to the same value
- * (e.g. 101→102 cols at 50%). */
-let composedBandTermCols = -1;
-
-/** F2: the files dock's clamped width (SV-07) for a terminal width — shared
- * by buildFilesDock and buildBand so the band split uses the SAME allocated
- * base the dock actually takes. */
-function dockColsFor(cols: number): number {
-	return Math.max(34, Math.min(48, Math.floor(cols * 0.25)));
-}
-
-function buildFilesDock(theme: Theme, inner: Component): Component {
-	const cols = tuiRef?.terminal?.columns ?? 120;
-	const panelCols = dockColsFor(cols);
-	composedDockCols = panelCols;
-	const panel = new FilesPanel(theme, () => tuiRef?.terminal?.rows ?? 0);
-	// Wrap the left subtree in a MeasurementSafeVStack — the dock
-	// HStack's discarded intrinsic-height measurement would otherwise eagerly
-	// render the ENTIRE left side (band + transcript) every keystroke frame.
-	// ENTRY FORM MATTERS: a bare component defaults to grow:0, and this
-	// wrapper's sentinel render measures as 1 row — with grow:0 a SHORTER-
-	// than-screen left subtree (e.g. trim mode's response doc) would collapse
-	// to its intrinsic height instead of stretching, blanking the left side.
-	const left = new MeasurementSafeVStack([
-		{ component: inner, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-	]);
-	return new HStack([
-		{ component: left, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-		{
-			component: panel,
-			basis: panelCols,
-			grow: 0,
-			shrink: 0,
-			minSize: panelCols,
-			visible: (v: { width: number }) => v.width >= MIN_TERM_WIDTH,
-		},
-	]);
-}
-
-/**
- * Panel C trim mode: replace the transcript region of the base root with a
- * ScrollView over our response doc. The editor dock (pending/status/editor/
- * widgets/footer) is reused verbatim from the base root's second entry, so
- * input is untouched and the composition stays lossless to toggle.
- */
 let responseScrollView: ScrollView | null = null;
+let responseDocInitialized = false;
+let preserveResponsePosition = false;
+let responseTheme: Theme | undefined;
+const transcriptScrollView = new ScrollView({
+	render: width => getNativeRegions()?.transcript.render(width) ?? [],
+}, { height: 1, followTail: true });
+let currentContext: ExtensionContext | undefined;
+let subagentsPanel: SubagentsPanel | undefined;
 
-/** Extract the editor dock from pi's base root (VStack[transcript, dock]). */
-function baseDockOf(base: any): Component | null {
-	const entries = base?.entries;
-	if (!Array.isArray(entries)) return null;
-	// The transcript entry holds the ScrollView (own `child`); the dock is the
-	// other entry.
-	for (const e of entries) {
-		const c = e?.component;
-		if (!c) continue;
-		if (!Object.hasOwn(c, "child")) return c as Component; // not a ScrollView → dock
-	}
-	return null;
-}
-
-/** Build the trimmed inner: VStack([responseScroll, dock]) like pi's viewport. */
-function buildTrimInner(theme: Theme): Component | null {
-	const base = getBaseRoot();
-	if (!base) return null;
-	const dock = baseDockOf(base);
-	if (!dock) return null;
-	if (!responseScrollView) {
-		responseScrollView = new ScrollView(responseDoc, {
-			follow: "end",
-			overscroll: "chain",
-			scrollbar: "auto",
-			scrollbarTrackStyle: (t: string) => theme.fg("dim", t),
-			scrollbarThumbStyle: (t: string) => theme.fg("accent", t),
-		});
-	}
-	return new VStack([
-		{ component: responseScrollView, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-		{ component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
-	]);
-}
-
-/** Build the full composed layout root based on enabled panels. */
-function composeLayout(theme: Theme, inner: Component): Component {
-	// Trim mode swaps pi's transcript for the response doc; the base root's
-	// dock (editor/footer) is preserved inside the swapped inner.
-	let root = inner;
-	if (trimResponse) {
-		const trimmed = buildTrimInner(theme);
-		if (trimmed) root = trimmed;
-	}
-	const wantBand = thinkingOn || toolsOn;
-	if (wantBand) root = buildBand(theme, root);
-	if (filesOn && tuiRef && typeof tuiRef.setLayoutRoot === "function")
-		root = buildFilesDock(theme, root);
-	return root;
-}
-
-/** Reconcile the single "ui" layout layer with the current panel flags. */
+/** Allocate geometry once per frame; never replace OMP's history provider. */
 function reconcileLayout(theme: Theme): void {
-	const wantAny = thinkingOn || toolsOn || filesOn || trimResponse;
-	if (!wantAny || !tuiRef || typeof tuiRef.setLayoutRoot !== "function") {
-		if (isLayoutLayerActive("ui")) setLayoutLayer("ui", null);
+	if (!tuiRef || !panelsActive()) {
+		setLayoutLayer(null);
 		return;
 	}
-	setLayoutLayer("ui", (inner: Component) => composeLayout(theme, inner));
-	// SV-08: remember the theme this composition was built with.
-	composedThemeFp = themeFingerprint(theme);
+	let panelFingerprint = "";
+	let thinkingPanel: ScrollView;
+	let toolPanel: ScrollView;
+	let filesPanel: FilesPanel;
+	let bodyRows = 1;
+	responseScrollView ??= new ScrollView(responseDoc, { height: 1, followTail: true });
+	setLayoutLayer((width, height) => {
+		const liveTheme = currentContext?.ui.theme ?? theme;
+		if (liveTheme !== responseTheme) {
+			responseTheme = liveTheme;
+			responseDoc.invalidate();
+		}
+		const fingerprint = themeFingerprint(liveTheme, SPLIT_THEME_COLORS);
+		if (fingerprint !== panelFingerprint) {
+			panelFingerprint = fingerprint;
+			const options = {
+				height: 1,
+				followTail: true,
+				scrollbar: "always" as const,
+				theme: {
+					track: (text: string) => liveTheme.fg("border", text),
+					thumb: (text: string) => liveTheme.fg("accent", text),
+				},
+			};
+			thinkingPanel = new ScrollView(new RecentBody(
+				liveTheme, line => liveTheme.fg("thinkingText", line),
+				w => thinkingLines(liveTheme, w), () => thinking.version,
+				"Thinking idle", () => bodyRows,
+			), options);
+			toolPanel = new ScrollView(new RecentBody(
+				liveTheme, line => line, w => toolLines(liveTheme, w),
+				toolsVersion, "No tools called yet", () => bodyRows,
+			), options);
+			filesPanel = new FilesPanel(liveTheme, () => termHeight);
+		}
+		termHeight = height;
+		const dockWidth = (filesOn || subagentsOn) && width >= MIN_TERM_WIDTH
+			? Math.max(34, Math.min(48, Math.floor(width * 0.25))) : 0;
+		const mainWidth = Math.max(1, width - dockWidth);
+		const dock: string[] = [];
+		for (const root of getNativeRegions()?.dock ?? []) dock.push(...root.render(mainWidth));
+		const bandRows = thinkingOn || toolsOn
+			? Math.min(bandHeight, Math.max(0, height - dock.length - 3)) : 0;
+		bodyRows = Math.max(0, bandRows - 2);
+		const frame: string[] = [];
+		const fit = (line: string, cols: number) => {
+			const clipped = truncateToWidth(line, cols, "");
+			return clipped + "\x1b[0m" + " ".repeat(Math.max(0, cols - visibleWidth(clipped)));
+		};
+		const panel = (scroll: ScrollView, cols: number, title: string, active: () => boolean) => {
+			scroll.setHeight(bodyRows);
+			return [
+				...new BorderTop(liveTheme, title, "accent", active).render(cols),
+				...scroll.render(cols),
+				...new BorderBottom(liveTheme).render(cols),
+			];
+		};
+		if (bandRows >= 3) {
+			if (thinkingOn && toolsOn && mainWidth >= 4) {
+				let toolsWidth = Math.round(mainWidth * toolsWidthPct / 100);
+				if (mainWidth >= 44) toolsWidth = Math.max(20, Math.min(mainWidth - 24, toolsWidth));
+				toolsWidth = Math.max(2, Math.min(mainWidth - 2, toolsWidth));
+				const thinkingWidth = mainWidth - toolsWidth;
+				const left = panel(thinkingPanel!, thinkingWidth, "Thinking", () => thinking.streaming);
+				const right = panel(toolPanel!, toolsWidth, "Tool Usage",
+					() => toolOrder.some(id => toolsBy.get(id)?.active));
+				for (let row = 0; row < bandRows; row++)
+					frame.push(fit(left[row] ?? "", thinkingWidth) + fit(right[row] ?? "", toolsWidth));
+			} else {
+				frame.push(...panel(
+					thinkingOn ? thinkingPanel! : toolPanel!, mainWidth,
+					thinkingOn ? "Thinking" : "Tool Usage",
+					() => thinkingOn ? thinking.streaming : toolOrder.some(id => toolsBy.get(id)?.active),
+				));
+			}
+		}
+		const chatHeight = Math.max(0, height - frame.length - dock.length);
+		const scroll = trimResponse ? responseScrollView! : transcriptScrollView;
+		scroll.setHeight(chatHeight);
+		frame.push(...scroll.render(mainWidth), ...dock);
+		if (trimResponse && preserveResponsePosition) {
+			responseScrollView!.setFollowTail(true);
+			preserveResponsePosition = false;
+		}
+		const visible = frame.slice(-height);
+		while (visible.length < height) visible.push("");
+		if (dockWidth) {
+			let subagentRows = 0;
+			let fileRows = 0;
+			if (subagentsOn && filesOn) {
+				subagentRows = height >= 12
+					? Math.max(4, Math.min(Math.floor(height / 2), height - 8))
+					: Math.min(4, height);
+				fileRows = height - subagentRows;
+			} else if (subagentsOn) subagentRows = height;
+			else if (filesOn) fileRows = height;
+			const right: string[] = [];
+			if (subagentRows > 0) right.push(...subagentsPanel!.render(liveTheme, dockWidth, subagentRows));
+			if (fileRows > 0) right.push(...filesPanel!.render(dockWidth, fileRows));
+			return visible.map((line, row) => fit(line, mainWidth) + fit(right[row] ?? "", dockWidth));
+		}
+		return visible;
+	});
 }
-
 // ─── wiring ──────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+	subagentsPanel = new SubagentsPanel(
+		(parentSessionId, data) => {
+			if (currentContext?.sessionManager.getSessionId() !== parentSessionId)
+				return false;
+			pi.appendEntry(SUBAGENT_SNAPSHOT_TYPE, data);
+			return true;
+		},
+		requestRender,
+		argsJson,
+	);
 	pi.registerFlag("no-split", {
 		description: "Start bare: skip the split-view panels (thinking/tools/files)",
 		type: "boolean",
@@ -1436,81 +1222,50 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	const ensureWidget = (ctx: ExtensionContext) => {
+		currentContext = ctx;
 		if (ctx.mode !== "tui" || widgetSet) return;
 		widgetSet = true;
-		ctx.ui.setWidget(
-			WIDGET_KEY,
-			(tui) => {
-				tuiRef = tui;
-				initLayoutManager(tui);
-				// SV-14: apply the still-pending startup composition here. The
-				// factory runs synchronously during session_start (before the
-				// first paint) and the fullscreen root is available right now, so
-				// the saved panels land in the FIRST painted frame. The deferred
-				// startupTimer remains as the fallback for a later-ready root.
-				if (startupPending && REG.gen === MY_GEN) {
-					startupPending = false;
-					reconcileLayout(tui?.theme ?? ctx.ui.theme);
-				}
-				return {
-					render: (width: number) => {
-						selfHealLayout();
-						// SV-08: pi swaps the global theme object on a theme change
-						// (extensions get no event) and the composition + response doc
-						// capture ANSI at build time. Compare a color fingerprint and
-						// recompose with the live theme ONLY on a change — ordinary
-						// state changes never rebuild the tree.
-						const liveTheme = tuiRef?.theme ?? ctx.ui.theme;
-						const fp = themeFingerprint(liveTheme);
-						if (composedThemeFp === null) composedThemeFp = fp;
-						else if (fp !== composedThemeFp) {
-							composedThemeFp = fp;
-							if (anyPanelActive()) {
-								rebuildResponseDoc(ctx);
-								reconcileLayout(liveTheme);
-							}
-						}
-						// SV-07: the dock basis is captured at compose time, so a resize
-						// used to leave the width frozen. Compare the clamped width the
-						// composition would use now and recompose on change; the 34–48
-						// clamp and the <90 hide rule are preserved (hide/show stays
-						// dynamic via the entry's visible callback).
-						if (
-							filesOn &&
-							typeof tuiRef?.setLayoutRoot === "function" &&
-							isLayoutLayerActive("ui")
-						) {
-							const cols = tuiRef?.terminal?.columns ?? 120;
-							const want = Math.max(
-								34,
-								Math.min(48, Math.floor(cols * 0.25)),
-							);
-							if (want !== composedDockCols)
-								reconcileLayout(tuiRef?.theme ?? ctx.ui.theme);
-						}
-							// F2: same recompose hook for the band's explicit width split,
-							// keyed on the TERMINAL width — any resize recomposes, even
-							// when the tools cols round to the same value (101→102 at 50%).
-							if (
-								thinkingOn &&
-								toolsOn &&
-								typeof tuiRef?.setLayoutRoot === "function" &&
-								isLayoutLayerActive("ui")
-							) {
-								const cols = tuiRef?.terminal?.columns ?? 120;
-								if (cols !== composedBandTermCols)
-									reconcileLayout(tuiRef?.theme ?? ctx.ui.theme);
-							}
-						return widgetLines(liveTheme, width);
-					},
-				};
-			},
-			{ placement: "belowEditor" },
-		);
+		const unsubscribe = ctx.ui.onTerminalInput(data => {
+			if (!isLayoutLayerActive() ||
+				tuiRef?.overlayStack.at(-1)?.component.debugKind !== "split-view") return;
+			if (!matchesKey(data, "pageUp") && !matchesKey(data, "pageDown")) return;
+			const scroll = trimResponse ? responseScrollView : transcriptScrollView;
+			if (!scroll?.handleScrollKey(data)) return;
+			requestRender();
+			return { consume: true };
+		});
+		ctx.ui.setWidget(WIDGET_KEY, tui => {
+			tuiRef = tui;
+			initLayoutManager(tui);
+			reconcileLayout(ctx.ui.theme);
+			return {
+				render: width => {
+					if (!panelsActive()) return [];
+					const lines = widgetLines(ctx.ui.theme, width);
+					if (trimResponse && panelNotice) lines.push(truncateToWidth(
+						ctx.ui.theme.fg(panelNotice.type === "info" ? "muted" : panelNotice.type, panelNotice.text),
+						width,
+					));
+					return lines;
+				},
+				dispose: () => {
+					unsubscribe();
+					panelNotice = undefined;
+					resetLayoutManager();
+					widgetSet = false;
+				},
+			};
+		}, { placement: "belowEditor" });
 	};
 
-	/** Rebuild all buffers from the current branch (start / reload / tree). */
+	/** Rebuild all buffers from the current branch (start / reload / switch /
+	 * branch / tree). */
 	const reconstruct = (ctx: ExtensionContext) => {
+		// Newest context first: the widget factory and the layout layer read
+		// `currentContext` for the live theme the moment either first renders.
+		currentContext = ctx;
+		void subagentsPanel!.activate(ctx);
+		ensureWidget(ctx);
 		thinking.reset();
 		toolsBy.clear();
 		toolOrder.length = 0;
@@ -1520,45 +1275,38 @@ export default function (pi: ExtensionAPI) {
 		clearEditDiff();
 		rebuildResponseDoc(ctx);
 
-		const branch = ctx.sessionManager.getBranch();
 		const thoughts: string[] = [];
-		for (const entry of branch) {
+		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "message") continue;
-			const msg = (entry as any).message;
-			if (!msg) continue;
-			if (msg.role === "assistant" && Array.isArray(msg.content)) {
+			const msg = entry.message;
+			if (msg.role === "assistant") {
 				for (const c of msg.content) {
-					if (c?.type === "thinking" && typeof c.thinking === "string")
-						thoughts.push(c.thinking);
-					if (c?.type === "toolCall" && c.name) {
-						try {
-							// SV-17: rebuild the bounded tools buffer from the
-							// branch through the same ingest path live events use.
-							if (typeof c.id === "string")
-								ingestToolCall(c.id, c.name, c.arguments ?? {});
-							record(c.name, c.arguments ?? {});
-						} catch {
-							/* skip */
-						}
+					if (c.type === "thinking") thoughts.push(c.thinking);
+					if (c.type !== "toolCall" || !c.name) continue;
+					try {
+						// SV-17: rebuild the bounded tools buffer from the
+						// branch through the same ingest path live events use.
+						ingestToolCall(c.id, c.name, c.arguments);
+						record(c.name, c.arguments);
+					} catch {
+						/* skip */
 					}
 				}
+				continue;
 			}
-			// Reconstruct the last edit diff from persisted tool-result details.
-			if (msg.role === "toolResult" && msg.toolName === "edit") {
-				const d = msg.details;
-				if (d?.diff) {
-					const p = (msg.input && msg.input.path) || editDiff.path;
-					setEditDiff(p, d.diff);
-				}
+			if (msg.role !== "toolResult") continue;
+			// Reconstruct the last edit diff from the persisted result details —
+			// the native edit tool reports the file it actually wrote.
+			if (msg.toolName === "edit") {
+				const result = editResultDiff(msg.details);
+				if (result) setEditDiff(result.path || editDiff.path, result.diff);
 			}
 			// SV-17: rebuild tool outputs from persisted results, correlated
 			// to their calls by toolCallId.
-			if (msg.role === "toolResult" && typeof msg.toolCallId === "string") {
-				try {
-					ingestToolResult(msg.toolCallId, msg.content, msg.isError);
-				} catch {
-					/* skip */
-				}
+			try {
+				ingestToolResult(msg.toolCallId, msg.content, msg.isError);
+			} catch {
+				/* skip */
 			}
 		}
 		if (thoughts.length) {
@@ -1570,7 +1318,6 @@ export default function (pi: ExtensionAPI) {
 			thinking.trim();
 			thinking.version++;
 		}
-		ensureWidget(ctx);
 		if (anyPanelActive()) requestRender();
 	};
 
@@ -1584,6 +1331,7 @@ export default function (pi: ExtensionAPI) {
 				thinking: false,
 				tools: false,
 				files: false,
+				subagents: false,
 				trimResponse: false,
 			};
 		}
@@ -1593,53 +1341,24 @@ export default function (pi: ExtensionAPI) {
 		bandHeight = cfg.bandHeight;
 		toolsWidthPct = cfg.toolsWidthPct;
 		filesOn = cfg.files;
+		subagentsOn = cfg.subagents;
 		trimResponse = cfg.trimResponse;
-		// SV-14: arm the startup composition BEFORE reconstruct — the widget
-		// factory runs synchronously inside it and is the first point where the
-		// fullscreen root is available (before the first paint). The deferred
-		// timer below used to be the ONLY composition point, but it fires after
-		// the first paint, so the first screen never showed the saved panels.
-		startupPending = ctx.mode === "tui";
 		reconstruct(ctx);
-		// Reapply the saved composition after the fullscreen root is ready.
-		if (ctx.mode === "tui") {
-			if (startupTimer) clearTimeout(startupTimer);
-			startupTimer = setTimeout(() => {
-				startupTimer = null;
-				if (REG.gen !== MY_GEN) return;
-				try {
-					if (tuiRef && typeof tuiRef.setLayoutRoot === "function") {
-						// SV-14: fallback — the factory composes when the root is
-						// already available there; this timer only composes if
-						// that has not happened yet.
-						if (startupPending) {
-							startupPending = false;
-							reconcileLayout(ctx.ui.theme);
-						}
-						if (cfg.split) ctx.ui.notify("Split view on", "info");
-					} else if (cfg.files) {
-						// Regular mode uses an overlay; filesOn is already the saved
-						// state, so clear it before calling the toggle.
-						filesOn = false;
-						toggleFilesPanel(ctx);
-					}
-				} catch {
-					/* never crash pi from a deferred callback */
-				}
-			}, 0);
-		}
+		if (ctx.mode === "tui") reconcileLayout(ctx.ui.theme);
 	});
+	// Subagent history spans every branch; ordinary panels keep their existing
+	// branch reconstruction behavior.
+	pi.on("session_switch", (_e, ctx) => reconstruct(ctx));
+	pi.on("session_branch", (_e, ctx) => reconstruct(ctx));
 	pi.on("session_tree", (_e, ctx) => reconstruct(ctx));
 
 	// Thinking stream.
 	pi.on("message_update", (event) => {
-		const d = (event as any).assistantMessageEvent;
-		if (d) {
-			if (d.type === "thinking_start") thinking.start();
-			else if (d.type === "thinking_delta") thinking.append(d.delta ?? "");
-			else if (d.type === "thinking_end") thinking.end(d.content ?? "");
-		}
-		responseMessageUpdate((event as any).message);
+		const delta = event.assistantMessageEvent;
+		if (delta.type === "thinking_start") thinking.start();
+		else if (delta.type === "thinking_delta") thinking.append(delta.delta);
+		else if (delta.type === "thinking_end") thinking.end(delta.content);
+		if (event.message.role === "assistant") responseMessageUpdate(event.message);
 		if (anyPanelActive()) requestRender();
 	});
 
@@ -1648,12 +1367,13 @@ export default function (pi: ExtensionAPI) {
 	// Assistant components are created lazily on first visible text (update),
 	// so tool-only / thinking-only rounds add nothing to the doc.
 	pi.on("message_start", (event) => {
-		const msg = (event as any).message;
-		if (msg?.role === "user") addResponseMessage(msg);
+		const msg = event.message;
+		if (msg.role === "user") addResponseUser(msg);
 		if (anyPanelActive()) requestRender();
 	});
 	pi.on("message_end", (event) => {
-		responseMessageEnd((event as any).message);
+		const msg = event.message;
+		if (msg.role === "assistant") responseMessageEnd(msg);
 		if (anyPanelActive()) requestRender();
 	});
 
@@ -1666,23 +1386,24 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_execution_update", (event) => {
 		const e = toolsBy.get(event.toolCallId);
 		if (e) {
-			setToolOutput(e, resultText((event as any).partialResult));
+			setToolOutput(e, resultText(event.partialResult));
 			markToolsDirty();
 		}
 		if (anyPanelActive()) requestRender();
 	});
 	pi.on("tool_execution_end", (event) => {
 		// SV-17: same ingest path the branch rebuild uses.
-		ingestToolResult(event.toolCallId, (event as any).result, event.isError);
+		ingestToolResult(event.toolCallId, event.result, event.isError);
 		if (anyPanelActive()) requestRender();
 	});
 
-	// Edit diff: preview on tool_call (preflight args), authoritative on result.
-	pi.on("tool_call", (event) => {
+	// Edit diff: preview from the call's own args, authoritative diff on result.
+	pi.on("tool_call", (event, ctx) => {
+		currentContext = ctx;
 		if (event.toolName !== "edit") {
 			// Still record files for non-edit tools (write/read/bash/grep...).
 			try {
-				record(event.toolName, event.input ?? {});
+				record(event.toolName, event.input);
 			} catch {
 				/* skip */
 			}
@@ -1690,26 +1411,12 @@ export default function (pi: ExtensionAPI) {
 			if (anyPanelActive()) requestRender();
 			return;
 		}
-		const input = event.input ?? {};
-		const p = typeof input.path === "string" ? input.path : "";
-		const edits = Array.isArray(input.edits) ? input.edits : [];
-		const token = ++pendingDiffToken;
-		// SV-23: this call is the newest edit — it owns the preview; forget
-		// older generations so a late result from an older edit cannot match.
-		const gen = ++editGeneration;
-		editGenByCallId.clear();
-		if (typeof event.toolCallId === "string")
-			editGenByCallId.set(event.toolCallId, gen);
-		// Compute a diff from the edit pairs (synchronous, no file read needed).
-		// generateDiffString(oldText, newText, contextLines) produces a unified diff.
-		const parts: string[] = [];
-		for (const e of edits) {
-			const o = typeof e.oldText === "string" ? e.oldText : "";
-			const n = typeof e.newText === "string" ? e.newText : "";
-			if (o !== n) parts.push(generateDiffString(o, n, 3).diff);
-		}
-		if (token !== pendingDiffToken) return;
-		if (parts.length) setEditDiff(p, parts.join("\n"));
+		const input = event.input;
+		editPreviewCallId = event.toolCallId;
+		// Modes whose args declare the change itself (replace / patch / freeform
+		// patch) preview without touching the filesystem.
+		const preview = editCallPreview(input);
+		if (preview) setEditDiff(preview.path, preview.diff);
 		try {
 			record("edit", input);
 		} catch {
@@ -1721,191 +1428,93 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_result", (event) => {
 		if (event.toolName !== "edit") return;
 		// Authoritative diff from the result details (branch-correct).
-		const d = (event as any).details;
-		if (d?.diff) {
-			// SV-23: apply only when this result belongs to the current edit
-			// generation (its own preview); an older result never overwrites a
-			// newer preview. A result with no/unknown ID applies only when
-			// unambiguous (a single edit generation, no recorded ID).
-			const id = (event as any).toolCallId;
-			const gen = typeof id === "string" ? editGenByCallId.get(id) : undefined;
-			const applies =
-				gen === editGeneration ||
-				(gen === undefined &&
-					editGeneration === 1 &&
-					editGenByCallId.size === 0);
-			if (applies) {
-				const p = (event.input && event.input.path) || editDiff.path;
-				setEditDiff(p, d.diff);
-				if (anyPanelActive()) requestRender();
-			}
-		}
+		const result = editResultDiff(event.details);
+		if (!result) return;
+		// A slower, older result must not overwrite a newer edit's preview.
+		if (event.toolCallId !== editPreviewCallId) return;
+		setEditDiff(result.path || editDiff.path, result.diff);
+		if (anyPanelActive()) requestRender();
 	});
 
-	// Subagent tool calls: record files with "a" op AND tool panel entries.
-	pi.events.on("subagents:tool_call", (data) => {
-		const { toolName, input, agent } = (data ?? {}) as {
-			toolName?: string;
-			input?: unknown;
-			agent?: string;
-		};
-		if (!toolName) return;
-		// Files tracking with "a" op.
-		try {
-			for (const { abs } of pathsFrom(toolName, input ?? {})) {
-				const prev = files.get(abs);
-				if (prev) {
-					files.delete(abs);
-					prev.count++;
-					if (!prev.ops.includes("a")) prev.ops += "a";
-					files.set(abs, prev);
-				} else {
-					if (files.size >= MAX_FILES)
-						files.delete(files.keys().next().value as string);
-					files.set(abs, { path: abs, ops: "a", count: 1 });
-				}
+	// Subagent activity: the native task framework publishes its frames on the
+	// session event bus (`pi.events`) — one channel per child's AgentSessionEvent
+	// and one for its lifecycle, whose `id` carries the agent name. (The legacy
+	// `subagents:tool_call` channel does not exist in OMP.)
+	const subagentAgentBy = new Map<string, string>();
+	pi.events.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, (data) => {
+		subagentsPanel!.onLifecycle(data);
+		const bag = fieldBag(data);
+		if (typeof bag.id !== "string" || typeof bag.agent !== "string") return;
+		if (bag.status === "started") subagentAgentBy.set(bag.id, bag.agent);
+		else subagentAgentBy.delete(bag.id);
+	});
+	pi.events.on(TASK_SUBAGENT_PROGRESS_CHANNEL, (data) => {
+		subagentsPanel!.onProgress(data);
+	});
+	pi.events.on(TASK_SUBAGENT_EVENT_CHANNEL, (data) => {
+		subagentsPanel!.onEvent(data);
+		const bag = fieldBag(data);
+		const frame = fieldBag(bag.event);
+		if (typeof bag.id !== "string" || typeof frame.toolCallId !== "string") return;
+		const id = `sub:${bag.id}:${frame.toolCallId}`;
+		if (frame.type === "tool_execution_start" && typeof frame.toolName === "string") {
+			ingestToolCall(id, frame.toolName, frame.args);
+			const entry = toolsBy.get(id);
+			if (entry) {
+				entry.subagent = true;
+				entry.agent = subagentAgentBy.get(bag.id) ?? bag.id;
 			}
+			for (const { abs } of pathsFrom(frame.toolName, frame.args)) recordPath(abs, "a");
 			bumpFilesVersion();
-		} catch {
-			/* never break the listener */
-		}
-		// Tool panel entry with [agent] badge.
-		const id = `sub:${Date.now()}:${Math.random().toString(36).slice(2, 7)}`;
-		toolOrder.push(id);
-		toolsBy.set(id, {
-			id,
-			name: toolName,
-			args: argsJson(input),
-			output: "",
-			active: false,
-			isError: false,
-			subagent: true,
-			agent,
-		});
-		toolsVersionCounter++;
-		if (toolOrder.length > MAX_TOOLS) {
-			const evict = toolOrder.shift()!;
-			toolsBy.delete(evict);
+		} else if (frame.type === "tool_execution_update") {
+			const entry = toolsBy.get(id);
+			if (entry) {
+				setToolOutput(entry, resultText(frame.partialResult));
+				markToolsDirty();
+			}
+		} else if (frame.type === "tool_execution_end") {
+			ingestToolResult(id, frame.result, frame.isError === true);
+		} else {
+			return;
 		}
 		if (anyPanelActive()) requestRender();
 	});
 
 	pi.on("session_shutdown", (_e, ctx) => {
-		if (startupTimer) {
-			clearTimeout(startupTimer);
-			startupTimer = null;
-		}
-		// SV-02/SV-15 (Option C): retire the overlay through the same valid
-		// owner for the CURRENT generation AND for a stale one. The
-		// identity-specific handle's hide() removes only its own entry (a safe
-		// no-op if Pi already removed it — it never pops an unrelated topmost
-		// overlay), and the stored component is disposed with it. Never merely
-		// forget REG.active: an undisposed stale-generation panel keeps
-		// rendering blank.
-		if (REG.active) {
-			REG.active.hide();
-			REG.active = null;
-		}
-		if (REG.panel) {
-			REG.panel.dispose();
-			REG.panel = null;
-		}
-		REG.activeGen = undefined;
-		if (isLayoutLayerActive("ui")) setLayoutLayer("ui", null);
+		cancelPendingThinkFlush();
+		cancelPendingToolsFlush();
+		resetLayoutManager();
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
+		subagentsPanel!.dispose();
 		widgetSet = false;
 	});
 
 	// ── panel toggles ──
 
-	/** Toggle the files panel (dock in fullscreen, overlay in regular). */
+	/** Files uses the same fullscreen owner, including a files-only layout. */
 	const toggleFilesPanel = (ctx: ExtensionContext): boolean => {
 		if (ctx.mode !== "tui") {
-			ctx.ui.notify("/files requires interactive mode", "error");
-			return filesActive();
+			notify(ctx, "/files requires interactive mode", "error");
+			return filesOn;
 		}
-		// Fullscreen: use the composed layer.
-		if (tuiRef && typeof tuiRef.setLayoutRoot === "function") {
-			if (filesOn) {
-				filesOn = false;
-				reconcileLayout(ctx.ui.theme);
-				ctx.ui.notify("Files panel closed", "info");
-				return false;
-			}
-			filesOn = true;
-			reconcileLayout(ctx.ui.theme);
-			// SV-24: be truthful when the dock is composed but gated invisible
-			// — the entry's visible callback hides it below MIN_TERM_WIDTH, so
-			// "docked right" alone would overstate what the user sees.
-			const dockCols = tuiRef?.terminal?.columns ?? 0;
-			if (dockCols > 0 && dockCols < MIN_TERM_WIDTH) {
-				ctx.ui.notify(
-					`Files panel on — hidden below ${MIN_TERM_WIDTH} cols (now ${dockCols})`,
-					"warning",
-				);
-			} else {
-				ctx.ui.notify("Files panel docked right", "info");
-			}
-			return true;
-		}
-		// Regular mode: passive TUI overlay (Option C — decisions/D-overlay-lifecycle.md).
-		// No ctx.ui.custom() promise is created, so nothing can be stranded; the
-		// extension owns the lifecycle: the identity-specific OverlayHandle is
-		// the only close path, and the panel component is disposed with it.
-		// Escape belongs to the editor/Pi — /files is the close/reopen path.
-		if (REG.active) {
-			const wasStale = REG.activeGen !== MY_GEN;
-			// SV-15: retire even a stale-generation overlay through the same
-			// valid owner (handle hide + component dispose) instead of merely
-			// forgetting REG.active.
-			REG.active.hide();
-			REG.panel?.dispose();
-			REG.active = null;
-			REG.panel = null;
-			REG.activeGen = undefined;
-			if (!wasStale) {
-				ctx.ui.notify("Files panel closed", "info");
-				return false;
-			}
-			// A stale overlay was retired — fall through and open a fresh one
-			// so a single /files leaves exactly one live overlay.
-		}
-		if ((process.stdout.columns ?? 0) < MIN_TERM_WIDTH) {
-			ctx.ui.notify(`Terminal too narrow (min ${MIN_TERM_WIDTH} cols)`, "warning");
-			return false;
-		}
-		if (!tuiRef || typeof tuiRef.showOverlay !== "function") {
-			ctx.ui.notify("/files requires interactive mode", "error");
-			return false;
-		}
-		const panel = new FilesPanel(ctx.ui.theme);
-		const cols = tuiRef?.terminal?.columns ?? process.stdout.columns ?? 0;
-		REG.panel = panel;
-		REG.active = tuiRef.showOverlay(panel, {
-			anchor: "top-right",
-			width: Math.max(34, Math.min(48, Math.floor(cols * 0.25))),
-			margin: 0,
-			maxHeight: "100%",
-			nonCapturing: true,
-			visible: (w: number, h: number) => {
-				termHeight = h;
-				return w >= MIN_TERM_WIDTH;
-			},
-		});
-		REG.activeGen = MY_GEN;
-		return true;
+		filesOn = !filesOn;
+		reconcileLayout(ctx.ui.theme);
+		const cols = tuiRef?.terminal.columns ?? 0;
+		notify(ctx,
+			!filesOn ? "Files panel closed" : cols < MIN_TERM_WIDTH
+				? `Files panel on — hidden below ${MIN_TERM_WIDTH} cols (now ${cols})`
+				: "Files panel docked right",
+			filesOn && cols < MIN_TERM_WIDTH ? "warning" : "info",
+		);
+		return filesOn;
 	};
 
 	pi.registerCommand("split", {
 		description:
-			"Toggle all panels: off = bare pi layout, on = saved startup defaults",
+			"Toggle all panels: off = native OMP layout, on = saved startup defaults",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui") {
-				ctx.ui.notify("/split requires interactive mode", "error");
-				return;
-			}
-			if (!tuiRef || typeof tuiRef.setLayoutRoot !== "function") {
-				ctx.ui.notify("/split requires fullscreen mode", "warning");
+				notify(ctx, "/split requires interactive mode", "error");
 				return;
 			}
 			// Full toggle pair (revised SV-01): OFF clears every panel flag so
@@ -1920,22 +1529,24 @@ export default function (pi: ExtensionAPI) {
 				thinkingOn = false;
 				toolsOn = false;
 				filesOn = false;
+				subagentsOn = false;
 				trimResponse = false;
 				reconcileLayout(ctx.ui.theme);
-				ctx.ui.notify("Split view off (all panels)", "info");
+				notify(ctx, "Split view off (all panels)", "info");
 			} else {
 				const cfg = normalizeConfig(loadUiPanelsConfig());
-				if (!cfg.thinking && !cfg.tools && !cfg.files && !cfg.trimResponse) {
+				if (!cfg.thinking && !cfg.tools && !cfg.files && !cfg.subagents && !cfg.trimResponse) {
 					thinkingOn = true;
 					toolsOn = true;
 				} else {
 					thinkingOn = cfg.thinking;
 					toolsOn = cfg.tools;
 					filesOn = cfg.files;
+					subagentsOn = cfg.subagents;
 					trimResponse = cfg.trimResponse;
 				}
 				reconcileLayout(ctx.ui.theme);
-				ctx.ui.notify("Split view on (saved layout)", "info");
+				notify(ctx, "Split view on (saved layout)", "info");
 			}
 		},
 	});
@@ -1947,10 +1558,10 @@ export default function (pi: ExtensionAPI) {
 			thinkingOn = !thinkingOn;
 			if (thinkingOn || toolsOn) {
 				reconcileLayout(ctx.ui.theme);
-				ctx.ui.notify(`Thinking ${thinkingOn ? "on" : "off"}`, "info");
+				notify(ctx, `Thinking ${thinkingOn ? "on" : "off"}`, "info");
 			} else {
 				reconcileLayout(ctx.ui.theme);
-				ctx.ui.notify("Band off (no panels)", "info");
+				notify(ctx, "Band off (no panels)", "info");
 			}
 		},
 	});
@@ -1961,10 +1572,36 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.mode !== "tui") return;
 			toolsOn = !toolsOn;
 			reconcileLayout(ctx.ui.theme);
-			ctx.ui.notify(`Tools ${toolsOn ? "on" : "off"}`, "info");
+			notify(ctx, `Tools ${toolsOn ? "on" : "off"}`, "info");
 		},
 	});
 
+	pi.registerCommand("split-subagents", {
+		description: "Toggle and navigate the subagents panel",
+		handler: async (args, ctx) => {
+			if (ctx.mode !== "tui") {
+				notify(ctx, "/split-subagents requires interactive mode", "error");
+				return;
+			}
+			const arg = String(args ?? "").trim().toLowerCase();
+			if (!arg) {
+				subagentsOn = !subagentsOn;
+				reconcileLayout(ctx.ui.theme);
+				const cols = tuiRef?.terminal.columns ?? 0;
+				notify(ctx, !subagentsOn ? "Subagents panel closed" : cols < MIN_TERM_WIDTH
+					? `Subagents panel on — hidden below ${MIN_TERM_WIDTH} cols (now ${cols})`
+					: "Subagents panel docked right",
+				subagentsOn && cols < MIN_TERM_WIDTH ? "warning" : "info");
+				return;
+			}
+			if (arg !== "up" && arg !== "down" && arg !== "live") {
+				notify(ctx, "Usage: /split-subagents [up|down|live]", "error");
+				return;
+			}
+			subagentsPanel!.navigate(arg);
+			requestRender();
+		},
+	});
 	pi.registerCommand("files", {
 		description: "Toggle the files panel (dock or overlay)",
 		handler: async (_args, ctx) => {
@@ -1977,7 +1614,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			toolMode = toolMode === "compact" ? "full" : "compact";
 			toolsVersionCounter++;
-			ctx.ui.notify(`Tool panel: ${toolMode}`, "info");
+			notify(ctx, `Tool panel: ${toolMode}`, "info");
 			requestRender();
 		},
 	});
@@ -1987,7 +1624,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const n = Number.parseInt(String(args ?? "").trim(), 10);
 			if (Number.isNaN(n)) {
-				ctx.ui.notify(
+				notify(ctx,
 					`Band height: ${bandHeight} rows (usage: /split-height 6-40)`,
 					"info",
 				);
@@ -1995,7 +1632,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			bandHeight = Math.max(6, Math.min(40, n));
 			reconcileLayout(ctx.ui.theme);
-			ctx.ui.notify(`Band height: ${bandHeight} rows`, "info");
+			notify(ctx, `Band height: ${bandHeight} rows`, "info");
 		},
 	});
 
@@ -2004,7 +1641,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const arg = String(args ?? "").trim();
 			if (!arg) {
-				ctx.ui.notify(
+				notify(ctx,
 					`Tools panel width: ${toolsWidthPct}% of the band (usage: /split-tools-width 20-60)`,
 					"info",
 				);
@@ -2012,7 +1649,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const n = Number.parseInt(arg, 10);
 			if (Number.isNaN(n)) {
-				ctx.ui.notify(
+				notify(ctx,
 					"Invalid percentage (usage: /split-tools-width 20-60)",
 					"error",
 				);
@@ -2020,7 +1657,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			toolsWidthPct = Math.max(20, Math.min(60, n));
 			reconcileLayout(ctx.ui.theme);
-			ctx.ui.notify(`Tools panel width: ${toolsWidthPct}%`, "info");
+			notify(ctx, `Tools panel width: ${toolsWidthPct}%`, "info");
 		},
 	});
 
@@ -2029,38 +1666,20 @@ export default function (pi: ExtensionAPI) {
 			"Panel C: full transcript ↔ response-only (on|off) — response-only: text-only (native parity), full scrollback, scroll offset preserved on branch switch",
 		handler: async (args, ctx) => {
 			if (ctx.mode !== "tui") {
-				ctx.ui.notify("/split-trim-response requires interactive mode", "error");
-				return;
-			}
-			if (!tuiRef || typeof tuiRef.setLayoutRoot !== "function") {
-				ctx.ui.notify("/split-trim-response requires fullscreen mode", "warning");
+				notify(ctx, "/split-trim-response requires interactive mode", "error");
 				return;
 			}
 			const arg = String(args ?? "")
 				.trim()
 				.toLowerCase();
 			const next = arg === "on" ? true : arg === "off" ? false : !trimResponse;
-			if (next) {
-				const base = getBaseRoot();
-				if (!base) {
-					ctx.ui.notify("Layout root not ready yet", "warning");
-					return;
-				}
-				// SV-22: trim mode swaps the transcript for the response doc and
-				// keeps only the extracted editor dock. If the dock cannot be
-				// extracted, fail loudly instead of silently leaving the native
-				// transcript while claiming response-only.
-				if (!baseDockOf(base)) {
-					ctx.ui.notify(
-						"Panel C unavailable: editor dock not found in the layout root",
-						"error",
-					);
-					return;
-				}
+			if (next && !getNativeRegions()) {
+				notify(ctx, "Panel C unavailable: native transcript not ready", "error");
+				return;
 			}
 			trimResponse = next;
 			reconcileLayout(ctx.ui.theme);
-			ctx.ui.notify(
+			notify(ctx,
 				`Panel C: ${trimResponse ? "response only" : "full transcript"}`,
 				"info",
 			);
@@ -2070,27 +1689,22 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("split-save", {
 		description: "Save current panel layout as the startup defaults",
 		handler: async (_args, ctx) => {
-			// SV-11: serialize the EFFECTIVE files state — a regular-mode files
-			// overlay of the CURRENT generation counts as files-on; an overlay left
-			// over from a stale generation must not save a phantom panel.
-			const filesEffective =
-				filesOn || (REG.active !== null && REG.activeGen === MY_GEN);
-			// SV-13: report the real outcome — success only after a durable write.
 			const saved = saveUiPanelsConfig({
 				split: thinkingOn || toolsOn,
 				thinking: thinkingOn,
 				tools: toolsOn,
-				files: filesEffective,
+				files: filesOn,
+				subagents: subagentsOn,
 				toolMode,
 				trimResponse,
 				bandHeight,
 				toolsWidthPct,
 			});
-			ctx.ui.notify(
+			notify(ctx,
 				saved
 					? "Panel layout saved as startup defaults for new windows"
 					: "Could not save panel layout (config write failed)",
-				saved ? "success" : "error",
+				saved ? "info" : "error",
 			);
 		},
 	});
