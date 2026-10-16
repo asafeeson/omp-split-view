@@ -534,10 +534,7 @@ function toolLines(theme: Theme, width: number): string[] {
 				? th.fg("muted", ` ${truncateInline(e.args, room)}`)
 				: "";
 		out.push(prefix + args);
-		if (!full) {
-			if (out.length > 1) out.splice(out.length - 1, 0, "");
-			continue;
-		}
+		if (!full) continue;
 		const content = (e.output || "")
 			.split(/\r?\n/)
 			.map((l) => l.trim())
