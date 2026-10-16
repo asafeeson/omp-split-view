@@ -1,6 +1,6 @@
 {
 	"name": "omp-split-view",
-	"version": "2.0.0",
+	"version": "2.0.1",
 	"description": "Split-view TUI plugin for oh-my-pi: thinking/tool band, run-history subagents and files docks, response-only transcript mode",
 	"license": "MIT",
 	"type": "module",
